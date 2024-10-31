@@ -1,4 +1,5 @@
 import io
+import json
 import os
 import pickle
 import time
@@ -8,7 +9,6 @@ from typing import List, Optional
 
 import mooncake_vllm_adaptor as mva
 import torch
-import yaml
 import zmq
 
 from vllm.distributed.kv_transfer.kv_pipe.base import KVPipeBase
@@ -28,9 +28,9 @@ class MooncakeTransferEngineConfig:
 
     @staticmethod
     def from_file(file_path: str) -> 'MooncakeTransferEngineConfig':
-        """Load the config from a YAML file."""
+        """Load the config from a JSON file."""
         with open(file_path, 'r') as fin:
-            config = yaml.safe_load(fin)
+            config = json.load(fin)
         return MooncakeTransferEngineConfig(
             local_url=config.get("local_url"),
             remote_url=config.get("remote_url"),
@@ -71,9 +71,8 @@ class MooncakeTransferEngine:
             self.config.remote_url, self.config.metadata_server,
             self.config.protocol, self.config.device_name)
 
-        self.remote_url = (
-            self.config.remote_url if rank_in_group == 0
-            else self.config.local_url)
+        self.remote_url = (self.config.remote_url
+                           if rank_in_group == 0 else self.config.local_url)
 
         # Initialize ZeroMQ context and sockets
         self.context = zmq.Context()  # type: ignore[attr-defined]
@@ -217,4 +216,3 @@ class MooncakeDistributedPipe(KVPipeBase):
         self.transfer_engine.receiver_socket.close()
         self.transfer_engine.context.term()  # Terminate the ZMQ context
         logger.info("Closed the transfer engine and cleaned up resources.")
-
