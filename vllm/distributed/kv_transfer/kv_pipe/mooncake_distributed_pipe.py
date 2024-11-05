@@ -78,8 +78,11 @@ class MooncakeTransferEngine:
         self.context = zmq.Context()  # type: ignore[attr-defined]
         self.sender_socket = self.context.socket(zmq.constants.PUSH)
         self.receiver_socket = self.context.socket(zmq.constants.PULL)
+        self.sender_ack = self.context.socket(zmq.constants.PULL)
+        self.receiver_ack = self.context.socket(zmq.constants.PUSH)
 
         host, port = self.remote_url.split(':')
+        self.buffer_cleaner = ThreadPoolExecutor(max_workers=1)
         self._setup_sockets(rank_in_group, host, port)
 
     def _setup_sockets(self, rank_in_group: int, host: str, port: str) -> None:
@@ -87,9 +90,13 @@ class MooncakeTransferEngine:
         if rank_in_group == 0:
             self.sender_socket.bind(f"tcp://*:{int(port) + 1}")
             self.receiver_socket.connect(f"tcp://{host}:{int(port) + 2}")
+            self.sender_ack.connect(f"tcp://{host}:{int(port) + 3}")
+            self.receiver_ack.bind(f"tcp://*:{int(port) + 4}")
         else:
-            self.sender_socket.bind(f"tcp://*:{int(port) + 2}")
             self.receiver_socket.connect(f"tcp://{host}:{int(port) + 1}")
+            self.sender_socket.bind(f"tcp://*:{int(port) + 2}")
+            self.receiver_ack.bind(f"tcp://*:{int(port) + 3}")
+            self.sender_ack.connect(f"tcp://{host}:{int(port) + 4}")
 
     def initialize(self, local_hostname: str, metadata_server: str,
                    protocol: str, device_name: str) -> None:
@@ -128,19 +135,34 @@ class MooncakeTransferEngine:
         """Read bytes from the allocated buffer."""
         return self.engine.readBytesFromBuffer(buffer, length)
 
+    def wait_for_ack(self, src_ptr: int, length: int) -> None:
+        """Asynchronously wait for ACK from the receiver."""
+        ack = self.sender_ack.recv_pyobj()
+        if ack != b'ACK':
+            logger.error("Failed to receive ACK from the receiver")
+
+        self.free_managed_buffer(src_ptr, length)
+
     def send_bytes(self, user_data: bytes) -> None:
         """Send bytes to the remote process."""
         length = len(user_data)
         src_ptr = self.allocate_managed_buffer(length)
         self.write_bytes_to_buffer(src_ptr, user_data, length)
         self.sender_socket.send_pyobj((src_ptr, length))
+        self.buffer_cleaner.submit(self.wait_for_ack, src_ptr, length)
 
     def recv_bytes(self) -> bytes:
         """Receive bytes from the remote process."""
         src_ptr, length = self.receiver_socket.recv_pyobj()
         dst_ptr = self.allocate_managed_buffer(length)
         self.transfer_sync(dst_ptr, src_ptr, length)
-        return self.read_bytes_from_buffer(dst_ptr, length)
+        ret = self.read_bytes_from_buffer(dst_ptr, length)
+
+        # Buffer cleanup
+        self.receiver_ack.send_pyobj((b'ACK'))
+        self.free_managed_buffer(dst_ptr, length)
+
+        return ret
 
 
 class MooncakeDistributedPipe(KVPipeBase):
@@ -157,10 +179,6 @@ class MooncakeDistributedPipe(KVPipeBase):
 
         assert self.rank_in_group <= 1
         self.device = self._select_device()
-        self.target_rank_for_send = self.ranks[(self.rank_in_group + 1) %
-                                               self.world_size]
-        self.target_rank_for_recv = self.ranks[(self.rank_in_group - 1) %
-                                               self.world_size]
 
         self.transfer_engine = MooncakeTransferEngine(self.rank_in_group)
         self.transport_thread: Optional[ThreadPoolExecutor] = None
