@@ -20,8 +20,8 @@ NONE_INT = -150886311
 
 @dataclass
 class MooncakeTransferEngineConfig:
-    local_url: str
-    remote_url: str
+    prefill_url: str
+    decode_url: str
     metadata_server: str
     protocol: str
     device_name: str
@@ -32,8 +32,8 @@ class MooncakeTransferEngineConfig:
         with open(file_path, 'r') as fin:
             config = json.load(fin)
         return MooncakeTransferEngineConfig(
-            local_url=config.get("local_url"),
-            remote_url=config.get("remote_url"),
+            prefill_url=config.get("prefill_url"),
+            decode_url=config.get("decode_url"),
             metadata_server=config.get("metadata_server"),
             protocol=config.get("protocol", "tcp"),
             device_name=config.get("device_name", ""),
@@ -67,12 +67,12 @@ class MooncakeTransferEngine:
             raise
 
         self.initialize(
-            self.config.local_url if rank_in_group == 0 else
-            self.config.remote_url, self.config.metadata_server,
+            self.config.prefill_url if rank_in_group == 0 else
+            self.config.decode_url, self.config.metadata_server,
             self.config.protocol, self.config.device_name)
 
-        self.remote_url = (self.config.remote_url
-                           if rank_in_group == 0 else self.config.local_url)
+        self.remote_url = (self.config.decode_url
+                           if rank_in_group == 0 else self.config.prefill_url)
 
         # Initialize ZeroMQ context and sockets
         self.context = zmq.Context()  # type: ignore[attr-defined]
