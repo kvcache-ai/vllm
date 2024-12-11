@@ -113,12 +113,11 @@ class MooncakeConnector(KVConnectorBase):
         start_layer = model_executable.model.start_layer
         end_layer = model_executable.model.end_layer
 
-        # fix potential bugs on Volta and Turing GPUs
         model_config = model_executable.model.config
-        hidden_size = model_config.hidden_size
         num_heads = model_config.num_key_value_heads
-        num_hidden_layers = model_config.num_attention_heads
-        head_size = int(hidden_size / num_hidden_layers)
+        hidden_size = model_config.hidden_size
+        num_attention_heads = model_config.num_attention_heads
+        head_size = int(hidden_size / num_attention_heads)
 
         # query_lens contains new KV caches that are added to vLLM.
         # so we will send them to decode instance
