@@ -10,6 +10,8 @@ All distributed communications are abstracted behind this class.
 
 from abc import ABC, abstractmethod
 from typing import List, Optional
+from vllm.config import VllmConfig
+from vllm.distributed.kv_transfer.kv_pipe.mooncake_pipe import MooncakeTransferEngineConfig
 
 import torch
 
@@ -107,3 +109,91 @@ class KVLookupBufferBase(ABC):
             NotImplementedError: This method must be implemented in subclasses.
         """
         raise NotImplementedError
+
+class MooncakeStore(KVLookupBufferBase):
+    def __init__(
+        self,
+        url: str,
+        local_tp_rank: int,
+        config: VllmConfig,
+    ):
+        """
+        from distributed_object_store import DistributedObjectStore
+        """
+        try:
+            import distributed_object_store as dos
+        except ImportError as e:
+            raise ImportError(
+                "Please install mooncake by following the instructions at "
+                "https://github.com/kvcache-ai/Mooncake/blob/main/doc/en/build.md "
+                "to run vLLM with MooncakeConnector.") from e
+        self.url = url
+        self.local_tp_rank = local_tp_rank
+        self.store = dos.DistributedObjectStore()  # 
+
+        try:
+            self.config = MooncakeTransferEngineConfig.load_from_env()
+            logger.info("Mooncake Configuration loaded successfully.")
+        except ValueError as e:
+            logger.error(e)
+            raise
+        except Exception as exc:
+            logger.error(
+                "An error occurred while loading the configuration: %s", exc)
+            raise
+        
+        self.store.initAll(self.config.protocol, 
+                           self.config.device_name, 
+                           3200 * 1024 * 1024)  # Init ALL, 3200 workaround
+
+    def insert(self, input_tokens: torch.Tensor, roi: torch.Tensor,
+               key: torch.Tensor, value: torch.Tensor,
+               hidden: torch.Tensor) -> None:
+        # V1 (pack and put all tensors): insert the tensors into MooncakeStore's buffer
+        raise NotImplementedError("Insert method is not implemented")
+
+    def drop_select(
+            self, input_tokens: Optional[torch.Tensor],
+            roi: Optional[torch.Tensor]) -> List[Optional[torch.Tensor]]:  
+        # V1 (get and unpack all tensors): consume tensors from MooncakeStore's buffer
+        raise NotImplementedError("Insert method is not implemented")
+  
+    def put(
+        self,
+        key: str,
+        value: Optional[torch.Tensor],
+    ) -> None:
+        # submit asynchronous put thread
+        if value is not None:
+            self._put_impl(key, value)
+      
+    def get(
+        self,
+        key: str,
+    ) -> Optional[torch.Tensor]:
+        # submit asynchronous get thread
+        value = self._get_impl(key)
+        if len(value) > 0:
+            return value
+        return None
+
+    def _put_impl(
+        self,
+        key: str,
+        value: torch.Tensor,
+    ) -> None:
+        """Put KVCache to Mooncake Store"""
+        value_bytes = pickle.dumps(tensor)
+        self.store.put(key, value_bytes)
+        
+    def _get_impl(
+        self,
+        key: str,
+    ) -> Optional[torch.Tensor]:
+        """Put KVCache from Mooncake Store"""
+        data = self.store.get(key)
+        data.
+        return pickle.loads(data)
+        
+
+
