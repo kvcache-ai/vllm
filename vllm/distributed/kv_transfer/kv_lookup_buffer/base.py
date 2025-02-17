@@ -192,7 +192,6 @@ class MooncakeStore(KVLookupBufferBase):
     ) -> Optional[torch.Tensor]:
         """Put KVCache from Mooncake Store"""
         data = self.store.get(key)
-        data.
         return pickle.loads(data)
         
 
