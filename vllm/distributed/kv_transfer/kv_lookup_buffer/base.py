@@ -14,6 +14,9 @@ from vllm.config import VllmConfig
 from vllm.distributed.kv_transfer.kv_pipe.mooncake_pipe import MooncakeTransferEngineConfig
 
 import torch
+from vllm.logger import init_logger
+
+logger = init_logger(__name__)
 
 
 class KVLookupBufferBase(ABC):
@@ -157,6 +160,9 @@ class MooncakeStore(KVLookupBufferBase):
             roi: Optional[torch.Tensor]) -> List[Optional[torch.Tensor]]:  
         # V1 (get and unpack all tensors): consume tensors from MooncakeStore's buffer
         raise NotImplementedError("Insert method is not implemented")
+    
+    def close(self):
+        pass
   
     def put(
         self,
