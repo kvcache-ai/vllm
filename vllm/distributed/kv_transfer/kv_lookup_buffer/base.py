@@ -11,7 +11,9 @@ All distributed communications are abstracted behind this class.
 from abc import ABC, abstractmethod
 from typing import List, Optional
 from vllm.config import VllmConfig
-from vllm.distributed.kv_transfer.kv_pipe.mooncake_pipe import MooncakeTransferEngineConfig
+import os
+import json
+from dataclasses import dataclass
 
 import torch
 from vllm.logger import init_logger
@@ -113,6 +115,40 @@ class KVLookupBufferBase(ABC):
         """
         raise NotImplementedError
 
+@dataclass
+class MooncakeStoreConfig:
+    local_hostname: str
+    metadata_server: str
+    global_segment_size: int
+    local_buffer_size: int
+    protocol: str
+    device_name: str
+    master_server_address: str
+
+    @staticmethod
+    def from_file(file_path: str) -> 'MooncakeStoreConfig':
+        """Load the config from a JSON file."""
+        with open(file_path) as fin:
+            config = json.load(fin)
+        return MooncakeStoreConfig(
+            local_hostname=config.get("local_hostname"),
+            metadata_server=config.get("metadata_server"),
+            global_segment_size=config.get("global_segment_size", 3355443200),
+            local_buffer_size=config.get("local_buffer_size", 1073741824),
+            protocol=config.get("protocol", "tcp"),
+            device_name=config.get("device_name", ""),
+            master_server_address=config.get("master_server_address"),
+        )
+
+    @staticmethod
+    def load_from_env() -> 'MooncakeStoreConfig':
+        """Load config from a file specified in the environment variable."""
+        config_file_path = os.getenv('MOONCAKE_CONFIG_PATH')
+        if config_file_path is None:
+            raise ValueError(
+                "The environment variable 'MOONCAKE_CONFIG_PATH' is not set.")
+        return MooncakeStoreConfig.from_file(config_file_path)
+
 class MooncakeStore(KVLookupBufferBase):
     def __init__(
         self,
@@ -135,7 +171,7 @@ class MooncakeStore(KVLookupBufferBase):
         self.store = dos.DistributedObjectStore()  # 
 
         try:
-            self.config = MooncakeTransferEngineConfig.load_from_env()
+            self.config = MooncakeStoreConfig.load_from_env()
             logger.info("Mooncake Configuration loaded successfully.")
         except ValueError as e:
             logger.error(e)
@@ -145,9 +181,13 @@ class MooncakeStore(KVLookupBufferBase):
                 "An error occurred while loading the configuration: %s", exc)
             raise
         
-        self.store.initAll(self.config.protocol, 
-                           self.config.device_name, 
-                           3200 * 1024 * 1024)  # Init ALL, 3200 workaround
+        self.store.setup(self.config.local_hostname, 
+                           self.config.metadata_server, 
+                           self.config.global_segment_size,
+                           self.config.local_buffer_size, 
+                           self.config.protocol, 
+                           self.config.device_name,
+                           self.config.master_server_address) 
 
     def insert(self, input_tokens: torch.Tensor, roi: torch.Tensor,
                key: torch.Tensor, value: torch.Tensor,
