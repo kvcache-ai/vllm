@@ -8,7 +8,7 @@ from tqdm import tqdm
 
 from vllm.config import KVTransferConfig
 from vllm.config import VllmConfig
-from vllm.distributed.kv_transfer.kv_lookup_buffer.base import MooncakeStore
+from vllm.distributed.kv_transfer.kv_lookup_buffer.kvstore_buffer import MooncakeStore
 
 
 if __name__ == "__main__":
