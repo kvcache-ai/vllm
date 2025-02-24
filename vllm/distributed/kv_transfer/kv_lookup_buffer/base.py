@@ -16,6 +16,7 @@ import json
 from dataclasses import dataclass
 
 import torch
+import pickle
 from vllm.logger import init_logger
 
 logger = init_logger(__name__)
@@ -160,7 +161,7 @@ class MooncakeStore(KVLookupBufferBase):
         from distributed_object_store import DistributedObjectStore
         """
         try:
-            import distributed_object_store as dos
+            import mooncake_vllm_adaptor as mva
         except ImportError as e:
             raise ImportError(
                 "Please install mooncake by following the instructions at "
@@ -168,7 +169,7 @@ class MooncakeStore(KVLookupBufferBase):
                 "to run vLLM with MooncakeConnector.") from e
         self.url = url
         self.local_tp_rank = local_tp_rank
-        self.store = dos.DistributedObjectStore()  # 
+        self.store = mva.mooncake_distributed_store()  # 
 
         try:
             self.config = MooncakeStoreConfig.load_from_env()
@@ -219,9 +220,7 @@ class MooncakeStore(KVLookupBufferBase):
     ) -> Optional[torch.Tensor]:
         # submit asynchronous get thread
         value = self._get_impl(key)
-        if len(value) > 0:
-            return value
-        return None
+        return value
 
     def _put_impl(
         self,
@@ -229,16 +228,19 @@ class MooncakeStore(KVLookupBufferBase):
         value: torch.Tensor,
     ) -> None:
         """Put KVCache to Mooncake Store"""
-        value_bytes = pickle.dumps(tensor)
+        value_bytes = pickle.dumps(value)
         self.store.put(key, value_bytes)
         
     def _get_impl(
         self,
         key: str,
     ) -> Optional[torch.Tensor]:
-        """Put KVCache from Mooncake Store"""
+        """Get KVCache from Mooncake Store"""
         data = self.store.get(key)
-        return pickle.loads(data)
+        if len(data):
+            return pickle.loads(data)
+        return None
+        
         
 
 

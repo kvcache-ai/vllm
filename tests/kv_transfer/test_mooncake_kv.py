@@ -15,5 +15,7 @@ if __name__ == "__main__":
 
     vllm_config = VllmConfig()
     mooncake = MooncakeStore("localhost", 0, vllm_config)
+    # mooncake.put("zzz", "yyy")
+    print(mooncake.get("ppp"))
 
     print('Done')
