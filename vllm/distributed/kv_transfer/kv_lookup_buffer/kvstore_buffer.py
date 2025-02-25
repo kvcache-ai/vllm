@@ -2,6 +2,7 @@
 import threading
 from collections import deque
 from typing import Deque, List, Optional, Union
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 
 import json
@@ -72,6 +73,9 @@ class MooncakeStore(KVLookupBufferBase):
         self.local_tp_rank = local_tp_rank
         self.store = mva.MooncakeDistributedStore()  # 
 
+        self.put_submit_thread = ThreadPoolExecutor(max_workers=1)
+        self.get_submit_thread = ThreadPoolExecutor(max_workers=1)
+
         try:
             self.config = MooncakeStoreConfig.load_from_env()
             logger.info("Mooncake Configuration loaded successfully.")
@@ -113,14 +117,14 @@ class MooncakeStore(KVLookupBufferBase):
     ) -> None:
         # submit asynchronous put thread
         if value is not None:
-            self._put_impl(key, value)
+            self.put_submit_thread.submit(self._put_impl, key, value)
       
     def get(
         self,
         key: str,
     ) -> Optional[torch.Tensor]:
         # submit asynchronous get thread
-        value = self._get_impl(key)
+        value = self.get_submit_thread.submit(self._get_impl, key).result()
         return value
 
     def _put_impl(
