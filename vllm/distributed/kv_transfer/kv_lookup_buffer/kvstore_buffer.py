@@ -73,8 +73,8 @@ class MooncakeStore(KVLookupBufferBase):
         self.local_tp_rank = local_tp_rank
         self.store = mva.MooncakeDistributedStore()  # 
 
-        self.put_submit_thread = ThreadPoolExecutor(max_workers=1)
-        self.get_submit_thread = ThreadPoolExecutor(max_workers=1)
+        self.put_submit_thread: Optional[ThreadPoolExecutor] = None
+        self.get_submit_thread: Optional[ThreadPoolExecutor] = None
 
         try:
             self.config = MooncakeStoreConfig.load_from_env()
@@ -116,6 +116,8 @@ class MooncakeStore(KVLookupBufferBase):
         value: Optional[torch.Tensor],
     ) -> None:
         # submit asynchronous put thread
+        if self.put_submit_thread is None:
+            self.put_submit_thread = ThreadPoolExecutor(max_workers=1)
         if value is not None:
             self.put_submit_thread.submit(self._put_impl, key, value)
       
@@ -124,6 +126,8 @@ class MooncakeStore(KVLookupBufferBase):
         key: str,
     ) -> Optional[torch.Tensor]:
         # submit asynchronous get thread
+        if self.get_submit_thread is None:
+            self.get_submit_thread = ThreadPoolExecutor(max_workers=1)
         value = self.get_submit_thread.submit(self._get_impl, key).result()
         return value
 
