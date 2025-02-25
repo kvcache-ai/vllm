@@ -130,14 +130,20 @@ class MooncakeStore(KVLookupBufferBase):
     ) -> None:
         """Put KVCache to Mooncake Store"""
         value_bytes = pickle.dumps(value)
-        self.store.put(key, value_bytes)
+        try:
+            self.store.put(key, value_bytes)
+        except TypeError as e:
+            raise TypeError("Mooncake Store Put Type Error.")
         
     def _get_impl(
         self,
         key: str,
     ) -> Optional[torch.Tensor]:
         """Get KVCache from Mooncake Store"""
-        data = self.store.get(key)
+        try:
+            data = self.store.get(key)
+        except TypeError as e:
+            raise TypeError("Mooncake Store Get Type Error.")
         if len(data):
             return pickle.loads(data)
         return None
