@@ -1,0 +1,171 @@
+# SPDX-License-Identifier: Apache-2.0
+"""
+This file contains a new class `MooncakeStore` that allows developers to
+think of KV cache transfer operations as put new KV cache entries (`insert`)
+into a remote KVStore-based lookup buffer and querying existing KV caches
+(`drop_select`) from this remote lookup buffer.
+"""
+import json
+import os
+import pickle
+from dataclasses import dataclass
+from typing import List, Optional
+
+import torch
+
+from vllm.config import VllmConfig
+from vllm.distributed.kv_transfer.kv_lookup_buffer.base import (
+    KVLookupBufferBase)
+from vllm.logger import init_logger
+
+logger = init_logger(__name__)
+
+
+@dataclass
+class MooncakeStoreConfig:
+    local_hostname: str
+    metadata_server: str
+    global_segment_size: int
+    local_buffer_size: int
+    protocol: str
+    device_name: str
+    master_server_address: str
+
+    @staticmethod
+    def from_file(file_path: str) -> 'MooncakeStoreConfig':
+        """Load the config from a JSON file."""
+        with open(file_path) as fin:
+            config = json.load(fin)
+        return MooncakeStoreConfig(
+            local_hostname=config.get("local_hostname"),
+            metadata_server=config.get("metadata_server"),
+            global_segment_size=config.get("global_segment_size", 3355443200),
+            local_buffer_size=config.get("local_buffer_size", 1073741824),
+            protocol=config.get("protocol", "tcp"),
+            device_name=config.get("device_name", ""),
+            master_server_address=config.get("master_server_address"),
+        )
+
+    @staticmethod
+    def load_from_env() -> 'MooncakeStoreConfig':
+        """Load config from a file specified in the environment variable."""
+        config_file_path = os.getenv('MOONCAKE_CONFIG_PATH')
+        if config_file_path is None:
+            raise ValueError(
+                "The environment variable 'MOONCAKE_CONFIG_PATH' is not set.")
+        return MooncakeStoreConfig.from_file(config_file_path)
+
+
+class MooncakeStore(KVLookupBufferBase):
+
+    def __init__(
+        self,
+        config: VllmConfig,
+    ):
+        try:
+            from mooncake_vllm_adaptor import MooncakeDistributedStore
+        except ImportError as e:
+            raise ImportError(
+                "Please install mooncake by following the instructions at "
+                "https://github.com/kvcache-ai/Mooncake/blob/main/doc/en/build.md "  # noqa: E501
+                "to run vLLM with MooncakeConnector.") from e
+
+        try:
+            self.store = MooncakeDistributedStore()
+            self.config = MooncakeStoreConfig.load_from_env()
+            logger.info("Mooncake Configuration loaded successfully.")
+
+            self.store.setup(self.config.local_hostname,
+                             self.config.metadata_server,
+                             self.config.global_segment_size,
+                             self.config.local_buffer_size,
+                             self.config.protocol, self.config.device_name,
+                             self.config.master_server_address)
+
+        except ValueError as e:
+            logger.error("Configuration loading failed: %s", e)
+            raise
+        except Exception as exc:
+            logger.error(
+                "An error occurred while loading the configuration: %s", exc)
+            raise
+
+    def insert(self, input_tokens: torch.Tensor, roi: torch.Tensor,
+               key: torch.Tensor, value: torch.Tensor, hidden: torch.Tensor,
+               store_keys_prefix: str, tp_rank: int) -> None:
+
+        kvcache_to_sent = torch.stack((key, value), dim=0)
+
+        store_keys = f"{store_keys_prefix}_{tp_rank}"
+        self.put(store_keys, kvcache_to_sent)
+
+        hidden_key = f"{store_keys_prefix}_hidden_{tp_rank}"
+        self.put(hidden_key, hidden)
+
+        roi_key = f"{store_keys_prefix}_roi_{tp_rank}"
+        self.put(roi_key, roi)
+        return
+
+    def drop_select(self, input_tokens: Optional[torch.Tensor],
+                    roi: Optional[torch.Tensor], load_keys_prefix: str,
+                    tp_rank: int) -> List[Optional[torch.Tensor]]:
+
+        load_keys = f"{load_keys_prefix}_{tp_rank}"
+        remote_kv = self.get(load_keys)
+
+        hidden_key = f"{load_keys_prefix}_hidden_{tp_rank}"
+        hidden = self.get(hidden_key)
+
+        roi_key = f"{load_keys_prefix}_roi_{tp_rank}"
+        roi = self.get(roi_key)
+        return [remote_kv, hidden, roi]
+
+    def close(self):
+        # MooncakeDistributedStore will automatically call the destructor, so
+        # it is unnecessary to close it manually.
+        pass
+
+    def put(
+        self,
+        key: str,
+        value: Optional[torch.Tensor],
+    ) -> None:
+        # A message queue needs to be introduced before making it asynchronous.
+        if value is not None:
+            self._put_impl(key, value)
+
+    def get(
+        self,
+        key: str,
+    ) -> Optional[torch.Tensor]:
+        # A message queue needs to be introduced before making it asynchronous.
+        value = self._get_impl(key)
+        return value
+
+    def _put_impl(
+        self,
+        key: str,
+        value: torch.Tensor,
+    ) -> None:
+        """Put KVCache to Mooncake Store"""
+        value_bytes = pickle.dumps(value)
+        try:
+            self.store.put(key, value_bytes)
+        except TypeError as err:
+            logger.error("Failed to put value into Mooncake Store: %s", err)
+            raise TypeError("Mooncake Store Put Type Error.") from err
+
+    def _get_impl(
+        self,
+        key: str,
+    ) -> Optional[torch.Tensor]:
+        """Get KVCache from Mooncake Store"""
+        try:
+            data = self.store.get(key)
+            if data:
+                return pickle.loads(data)
+        except TypeError as err:
+            logger.error("Failed to get value from Mooncake Store: %s", err)
+            raise TypeError("Mooncake Store Get Type Error.") from err
+
+        return None
