@@ -7,11 +7,12 @@ into a remote KVStore-based lookup buffer and querying existing KV caches
 """
 import json
 import os
-import pickle
 from dataclasses import dataclass
 from typing import List, Optional
 
 import torch
+from safetensors.torch import load as safetensors_load
+from safetensors.torch import save as safetensors_save
 
 from vllm.config import VllmConfig
 from vllm.distributed.kv_transfer.kv_lookup_buffer.base import (
@@ -62,6 +63,7 @@ class MooncakeStore(KVLookupBufferBase):
         self,
         config: VllmConfig,
     ):
+
         try:
             from mooncake_vllm_adaptor import MooncakeDistributedStore
         except ImportError as e:
@@ -148,7 +150,12 @@ class MooncakeStore(KVLookupBufferBase):
         value: torch.Tensor,
     ) -> None:
         """Put KVCache to Mooncake Store"""
-        value_bytes = pickle.dumps(value)
+        device_id = value.device.index if value.device.type == 'cuda' else -1
+        device_tensor = torch.tensor(device_id, dtype=torch.int32)
+        value_bytes = safetensors_save({
+            "tensor": value,
+            "device_id": device_tensor
+        })
         try:
             self.store.put(key, value_bytes)
         except TypeError as err:
@@ -162,10 +169,17 @@ class MooncakeStore(KVLookupBufferBase):
         """Get KVCache from Mooncake Store"""
         try:
             data = self.store.get(key)
-            if data:
-                return pickle.loads(data)
         except TypeError as err:
             logger.error("Failed to get value from Mooncake Store: %s", err)
             raise TypeError("Mooncake Store Get Type Error.") from err
+
+        if data:
+            loaded_tensors = safetensors_load(data)
+            tensor = loaded_tensors["tensor"]
+            device_id_tensor = loaded_tensors["device_id"]
+            device_id = int(device_id_tensor.item())
+            device = torch.device(
+                'cuda', device_id) if device_id >= 0 else torch.device('cpu')
+            return tensor.to(device)
 
         return None
