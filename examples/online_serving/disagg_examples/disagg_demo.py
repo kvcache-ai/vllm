@@ -33,17 +33,20 @@ if __name__ == "__main__":
 
     parser.add_argument(
         "--scheduling-policy",
+        "--scheduling",
+        "-S",
         type=str,
         choices=["round_robin", "random"],
         default="round_robin",
         help="Proxy scheduling strategy",
     )
 
-    parser.add_argument("--port",
-                        type=int,
-                        default=8000,
-                        help="Server port number")
-
+    parser.add_argument(
+        "--port",
+        type=int,
+        default=8000,
+        help="Server port number",
+    )
     args = parser.parse_args()
     proxy_server = ProxyServer(args=args)
     proxy_server.run_server()

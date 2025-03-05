@@ -1874,6 +1874,11 @@ class ModelRunner(GPUModelRunnerBase[ModelInputForGPUWithSamplingMetadata]):
         if self.vllm_config.kv_transfer_config is None:
             return False
 
+        load_keys_list = model_input.kv_transfer_params.kvcache_load_keys
+
+        if all(key is None for key in load_keys_list):
+            return False
+
         prefill_meta = model_input.attn_metadata.prefill_metadata
 
         # check if the current run is profiling
@@ -1897,6 +1902,10 @@ class ModelRunner(GPUModelRunnerBase[ModelInputForGPUWithSamplingMetadata]):
         """
 
         if self.vllm_config.kv_transfer_config is None:
+            return False
+
+        store_keys_list = model_input.kv_transfer_params.kvcache_store_keys
+        if all(key is None for key in store_keys_list):
             return False
 
         prefill_meta = model_input.attn_metadata.prefill_metadata
