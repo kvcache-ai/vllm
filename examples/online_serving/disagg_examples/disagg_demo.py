@@ -36,7 +36,7 @@ if __name__ == "__main__":
         "--scheduling",
         "-S",
         type=str,
-        choices=["round_robin", "random"],
+        choices=["round_robin"],
         default="round_robin",
         help="Proxy scheduling strategy",
     )

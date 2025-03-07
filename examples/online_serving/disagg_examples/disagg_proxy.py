@@ -9,6 +9,7 @@ from abc import ABC, abstractmethod
 from typing import Callable, Optional
 
 import aiohttp
+import requests
 import uvicorn
 from fastapi import (APIRouter, Depends, FastAPI, Header, HTTPException,
                      Request, status)
@@ -61,7 +62,6 @@ class Proxy:
         custom_create_chat_completion: Optional[Callable[
             [Request], StreamingResponse]] = None,
     ):
-
         self.prefill_instances = prefill_instances
         self.decode_instances = decode_instances
         self.prefill_cycler = itertools.cycle(prefill_instances)
@@ -416,6 +416,7 @@ class ProxyServer:
         create_chat_completion: Optional[Callable[[Request],
                                                   StreamingResponse]] = None,
     ):
+        self.validate_parsed_serve_args(args)
         self.port = args.port
         self.proxy_instance = Proxy(
             prefill_instances=[] if args.prefill is None else args.prefill,
@@ -426,6 +427,48 @@ class ProxyServer:
             custom_create_completion=create_completion,
             custom_create_chat_completion=create_chat_completion,
         )
+
+    def validate_parsed_serve_args(self, args: argparse.Namespace):
+        if not args.prefill:
+            raise ValueError("Please specify at least one prefill node.")
+        if not args.decode:
+            raise ValueError("Please specify at least one decode node.")
+        self.validate_instances(args.prefill)
+        self.validate_instances(args.decode)
+        self.verify_model_config(args.prefill, args.model)
+        self.verify_model_config(args.decode, args.model)
+
+    def validate_instances(self, instances: list):
+        for instance in instances:
+            if len(instance.split(":")) != 2:
+                raise ValueError(f"Invalid instance format: {instance}")
+            host, port = instance.split(":")
+            try:
+                if host != "localhost":
+                    ipaddress.ip_address(host)
+                port = int(port)
+                if not (0 < port < 65536):
+                    raise ValueError(
+                        f"Invalid port number in instance: {instance}")
+            except Exception as e:
+                raise ValueError(
+                    f"Invalid instance {instance}: {str(e)}") from e
+
+    def verify_model_config(self, instances: list, model: str) -> None:
+        for instance in instances:
+            try:
+                response = requests.get(f"http://{instance}/v1/models")
+                if response.status_code == 200:
+                    model_cur = response.json()["data"][0]["id"]
+                    if model_cur != model:
+                        raise ValueError(
+                            f"{instance} serves a different model: "
+                            f"{model_cur} != {model}")
+                else:
+                    raise ValueError(f"Cannot get model id from {instance}!")
+            except requests.RequestException as e:
+                raise ValueError(
+                    f"Error communicating with {instance}: {str(e)}") from e
 
     def run_server(self):
         app = FastAPI()
