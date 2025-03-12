@@ -8,11 +8,13 @@ into a remote KVStore-based lookup buffer and querying existing KV caches
 import json
 import os
 from dataclasses import dataclass
-from typing import List, Optional
+from typing import List, Optional, Tuple
 
 import torch
 from safetensors.torch import load as safetensors_load
 from safetensors.torch import save as safetensors_save
+import numpy as np
+import struct
 
 from vllm.config import VllmConfig
 from vllm.distributed.kv_transfer.kv_lookup_buffer.base import (
@@ -21,6 +23,32 @@ from vllm.logger import init_logger
 
 logger = init_logger(__name__)
 
+def tensor_to_bytes(tensor: torch.Tensor) -> bytes:
+    """Tensor to Bytes"""
+    
+    # Get metadata
+    dtype = str(tensor.dtype).split('.')[-1]
+    shape = tensor.numpy().shape
+    data = tensor.numpy().tobytes()
+    
+    # Concat metadata and data
+    header = f'{{"dtype":"{dtype}","shape":{list(shape)}}}'.encode('utf-8')
+    header_len = struct.pack('>I', len(header))
+    return header_len + header + data
+
+def bytes_to_tensor(data: bytes) -> torch.Tensor:
+    """Bytes to Tensor"""
+    # Get metadata and data
+    header_len = struct.unpack('>I', data[:4])[0]
+    header = eval(data[4:4+header_len])
+    buffer = data[4+header_len:]
+    
+    # construct NumPy
+    np_array = np.frombuffer(buffer, dtype=header['dtype'])
+    np_array = np_array.reshape(header['shape'])
+    
+    # Transfer PyTorch Tensor
+    return torch.from_numpy(np_array.copy())
 
 @dataclass
 class MooncakeStoreConfig:
@@ -150,12 +178,13 @@ class MooncakeStore(KVLookupBufferBase):
         value: torch.Tensor,
     ) -> None:
         """Put KVCache to Mooncake Store"""
-        device_id = value.device.index if value.device.type == 'cuda' else -1
-        device_tensor = torch.tensor(device_id, dtype=torch.int32)
-        value_bytes = safetensors_save({
-            "tensor": value,
-            "device_id": device_tensor
-        })
+        # device_id = value.device.index if value.device.type == 'cuda' else -1
+        # device_tensor = torch.tensor(device_id, dtype=torch.int32)
+        # value_bytes = safetensors_save({
+        #     "tensor": value,
+        #     "device_id": device_tensor
+        # })
+        value_bytes = tensor_to_bytes(value)
         try:
             self.store.put(key, value_bytes)
         except TypeError as err:
@@ -174,12 +203,13 @@ class MooncakeStore(KVLookupBufferBase):
             raise TypeError("Mooncake Store Get Type Error.") from err
 
         if data:
-            loaded_tensors = safetensors_load(data)
-            tensor = loaded_tensors["tensor"]
-            device_id_tensor = loaded_tensors["device_id"]
-            device_id = int(device_id_tensor.item())
-            device = torch.device(
-                'cuda', device_id) if device_id >= 0 else torch.device('cpu')
-            return tensor.to(device)
+            return bytes_to_tensor(data)
+            # loaded_tensors = safetensors_load(data)
+            # tensor = loaded_tensors["tensor"]
+            # device_id_tensor = loaded_tensors["device_id"]
+            # device_id = int(device_id_tensor.item())
+            # device = torch.device(
+            #     'cuda', device_id) if device_id >= 0 else torch.device('cpu')
+            # return tensor.to(device)
 
         return None
