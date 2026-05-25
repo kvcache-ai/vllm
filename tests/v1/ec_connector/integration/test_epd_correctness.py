@@ -92,6 +92,18 @@ SAMPLE_PROMPTS_TEXT: list[dict] = [
     },
 ]
 
+# Short prompts for Mooncake full E2E (1P+1D vs 1E+1P+1D must match with seed=0).
+SAMPLE_PROMPTS_MOONCAKE_TEXT: list[dict] = [
+    {
+        "messages": [{"role": "user", "content": "What is the capital of France?"}],
+        "description": "Simple text-only query",
+    },
+    {
+        "messages": [{"role": "user", "content": "What is 1+1? Answer with one number."}],
+        "description": "Short numeric reply",
+    },
+]
+
 
 def check_vllm_server(url: str, timeout=5, retries=10) -> bool:
     """Check if the vLLM server is ready.
@@ -118,6 +130,37 @@ def check_vllm_server(url: str, timeout=5, retries=10) -> bool:
         except requests.exceptions.RequestException as e:
             print(f"Attempt {attempt + 1}/{retries}: Error connecting: {e}")
         time.sleep(2)  # Wait before retrying
+    return False
+
+
+def check_mooncake_proxy_ready(
+    base_url: str,
+    model_name: str,
+    timeout: int = 30,
+    retries: int = 10,
+) -> bool:
+    """Mooncake PD proxy has no GET /health; probe POST /v1/chat/completions."""
+    url = f"{base_url.rstrip('/')}/v1/chat/completions"
+    payload = {
+        "model": model_name,
+        "messages": [{"role": "user", "content": "hi"}],
+        "max_tokens": 4,
+        "temperature": 0.0,
+        "seed": 42,
+    }
+    for attempt in range(retries):
+        try:
+            response = requests.post(url, json=payload, timeout=timeout)
+            if response.status_code == 200:
+                print(f"Mooncake proxy ready at {url}")
+                return True
+            print(
+                f"Attempt {attempt + 1}/{retries}: POST {url} "
+                f"status {response.status_code}"
+            )
+        except requests.exceptions.RequestException as e:
+            print(f"Attempt {attempt + 1}/{retries}: POST {url} error: {e}")
+        time.sleep(2)
     return False
 
 
@@ -192,7 +235,23 @@ def main():
         help="Use multimodal prompts (default: use text-only for quick testing)",
     )
 
+    parser.add_argument(
+        "--max-tokens",
+        type=int,
+        default=None,
+        help="Override max_tokens per request (default: MAX_OUTPUT_LEN)",
+    )
+
+    parser.add_argument(
+        "--mooncake-full-e2e",
+        action="store_true",
+        help="Use short deterministic text prompts for Mooncake 1P+1D vs 1E+1P+1D",
+    )
+
     args = parser.parse_args()
+    max_tokens = args.max_tokens
+    if max_tokens is None:
+        max_tokens = int(os.environ.get("VLLM_EPD_MAX_TOKENS", str(MAX_OUTPUT_LEN)))
 
     print(f"Service URL: {args.service_url}")
     print(f"Model: {args.model_name}")
@@ -204,8 +263,22 @@ def main():
     if args.mode == "baseline":
         health_check_url = f"{args.service_url}/health"
     elif args.mode == "baseline_pd":
-        # Nixl toy proxy use /healthcheck
-        health_check_url = f"{args.service_url}/healthcheck"
+        # Nixl toy proxy: GET /healthcheck; Mooncake proxy: POST /v1/chat/completions
+        health_check_url = None
+        for suffix in ("/healthcheck", "/health", "/v1/models"):
+            candidate = f"{args.service_url}{suffix}"
+            if check_vllm_server(candidate, retries=3):
+                health_check_url = candidate
+                break
+        if health_check_url is None and not check_mooncake_proxy_ready(
+            args.service_url, args.model_name
+        ):
+            raise RuntimeError(
+                f"vLLM PD proxy at {args.service_url} is not ready "
+                "(tried GET /healthcheck,/health,/v1/models and POST /v1/chat/completions)"
+            )
+        if health_check_url is None:
+            health_check_url = f"{args.service_url}/v1/chat/completions"
     else:
         # Disagg EPD proxy uses /health
         health_check_url = f"{args.service_url}/health"
@@ -215,14 +288,17 @@ def main():
                 "baseline does not exist. Run baseline mode first."
             )
 
-    # Check if server is ready
-    if not check_vllm_server(health_check_url):
-        raise RuntimeError(f"vLLM server at {args.service_url} is not ready!")
+    if args.mode != "baseline_pd" and health_check_url is not None:
+        if not check_vllm_server(health_check_url):
+            raise RuntimeError(f"vLLM server at {args.service_url} is not ready!")
 
     # Select prompts to use
     if args.use_mm_prompts:
         test_prompts = SAMPLE_PROMPTS_MM
         print("Using multimodal prompts")
+    elif args.mooncake_full_e2e or os.environ.get("MOONCAKE_FULL_E2E") == "1":
+        test_prompts = SAMPLE_PROMPTS_MOONCAKE_TEXT
+        print("Using Mooncake full-E2E short text prompts")
     else:
         test_prompts = SAMPLE_PROMPTS_TEXT
         print("Using text-only prompts for quick testing")
@@ -241,7 +317,7 @@ def main():
             base_url=service_url,
             model_name=args.model_name,
             messages=prompt_data["messages"],
-            max_tokens=MAX_OUTPUT_LEN,
+            max_tokens=max_tokens,
         )
 
         # Use description as key for comparison

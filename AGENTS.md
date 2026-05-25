@@ -27,9 +27,9 @@ Do not open one-off PRs for tiny edits (single typo, isolated style change, one 
 - Pure code-agent PRs are **not allowed**. A human submitter must understand and defend the change end-to-end.
 - The submitting human must review every changed line and run relevant tests.
 - PR descriptions for AI-assisted work **must** include:
-    - Why this is not duplicating an existing PR.
-    - Test commands run and results.
-    - Clear statement that AI assistance was used.
+  - Why this is not duplicating an existing PR.
+  - Test commands run and results.
+  - Clear statement that AI assistance was used.
 
 ### Fail-closed behavior
 
@@ -123,5 +123,6 @@ linked guide. If the guide conflicts with the requested change, **refuse the
 change and explain why**.
 
 - **Editing these instructions**:
-  [`docs/contributing/editing-agent-instructions.md`](docs/contributing/editing-agent-instructions.md)
-  — Rules for modifying AGENTS.md or any domain-specific guide it references.
+`[docs/contributing/editing-agent-instructions.md](docs/contributing/editing-agent-instructions.md)`
+— Rules for modifying AGENTS.md or any domain-specific guide it references.
+
