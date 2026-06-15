@@ -39,6 +39,12 @@ from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.mooncake_utils import
 from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.stats import (
     MooncakeKVConnectorStats,
 )
+from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.transfer_guard import (
+    MooncakeTransferVerifier,
+    get_remote_session_lock,
+    mooncake_transfer_verify_enabled,
+    sync_device_after_remote_kv_write,
+)
 from vllm.distributed.parallel_state import (
     get_pp_group,
     get_tensor_model_parallel_rank,
@@ -841,6 +847,12 @@ class MooncakeConnectorWorker:
 
         self.xfer_stats = MooncakeKVConnectorStats()
 
+        self._transfer_verifier: MooncakeTransferVerifier | None = None
+        if self.is_kv_producer and mooncake_transfer_verify_enabled():
+            self._transfer_verifier = MooncakeTransferVerifier(
+                self.engine, torch.device(f"cuda:{self.device_id}")
+            )
+
         self.block_size = vllm_config.cache_config.block_size
         self.model_config = vllm_config.model_config
         self.cache_config = vllm_config.cache_config
@@ -1362,9 +1374,15 @@ class MooncakeConnectorWorker:
         lengths: list[int],
     ) -> int:
         start_time = time.perf_counter()
-        ret_value = self.engine.batch_transfer_sync_write(
-            remote_session, src_ptrs, dst_ptrs, lengths
-        )
+        with get_remote_session_lock(remote_session):
+            ret_value = self.engine.batch_transfer_sync_write(
+                remote_session, src_ptrs, dst_ptrs, lengths
+            )
+            if ret_value == 0 and self._transfer_verifier is not None:
+                if not self._transfer_verifier.verify_remote_visibility(
+                    remote_session, src_ptrs, dst_ptrs, lengths
+                ):
+                    ret_value = -1
         duration = time.perf_counter() - start_time
         if ret_value == 0:
             self.xfer_stats.record_transfer(
@@ -1594,6 +1612,11 @@ class MooncakeConnectorWorker:
         pull_metas: dict[ReqId, PullReqMeta],
     ):
         ok_reqs: list[ReqId] = response.ok_reqs or []
+
+        if ok_reqs:
+            sync_device_after_remote_kv_write(
+                torch.device(f"cuda:{self.device_id}")
+            )
 
         for req_id in ok_reqs:
             pull_meta = pull_metas[req_id]
