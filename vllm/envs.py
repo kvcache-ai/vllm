@@ -213,10 +213,6 @@ if TYPE_CHECKING:
     VLLM_MORIIO_POST_BATCH_SIZE: int = -1
     VLLM_MORIIO_NUM_WORKERS: int = 1
     VLLM_MOONCAKE_ABORT_REQUEST_TIMEOUT: int = 480
-    VLLM_MOONCAKE_TRANSFER_VERIFY: bool = True
-    VLLM_MOONCAKE_TRANSFER_VERIFY_TAIL_BYTES: int = 64
-    VLLM_MOONCAKE_TRANSFER_VERIFY_MAX_RETRIES: int = 500
-    VLLM_MOONCAKE_TRANSFER_VERIFY_RETRY_SLEEP_S: float = 0.001
     VLLM_ENABLE_CUDAGRAPH_GC: bool = False
     VLLM_LOOPBACK_IP: str = ""
     VLLM_ALLOW_CHUNKED_LOCAL_ATTN_WITH_HYBRID_KV_CACHE: bool = True
@@ -1519,19 +1515,6 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Timeout (in seconds) for MooncakeConnector in PD disaggregated setup.
     "VLLM_MOONCAKE_ABORT_REQUEST_TIMEOUT": lambda: int(
         os.getenv("VLLM_MOONCAKE_ABORT_REQUEST_TIMEOUT", "480")
-    ),
-    # RDMA read-back verification after MooncakeConnector KV writes (PD mode).
-    "VLLM_MOONCAKE_TRANSFER_VERIFY": lambda: (
-        os.getenv("VLLM_MOONCAKE_TRANSFER_VERIFY", "True").lower() in ("true", "1")
-    ),
-    "VLLM_MOONCAKE_TRANSFER_VERIFY_TAIL_BYTES": lambda: int(
-        os.getenv("VLLM_MOONCAKE_TRANSFER_VERIFY_TAIL_BYTES", "64")
-    ),
-    "VLLM_MOONCAKE_TRANSFER_VERIFY_MAX_RETRIES": lambda: int(
-        os.getenv("VLLM_MOONCAKE_TRANSFER_VERIFY_MAX_RETRIES", "500")
-    ),
-    "VLLM_MOONCAKE_TRANSFER_VERIFY_RETRY_SLEEP_S": lambda: float(
-        os.getenv("VLLM_MOONCAKE_TRANSFER_VERIFY_RETRY_SLEEP_S", "0.001")
     ),
     # If set, it means we pre-downloaded cubin files and flashinfer will
     # read the cubin files directly.

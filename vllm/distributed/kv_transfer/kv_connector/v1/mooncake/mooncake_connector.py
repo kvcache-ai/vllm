@@ -42,7 +42,6 @@ from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.stats import (
 from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.transfer_guard import (
     MooncakeTransferVerifier,
     get_remote_session_lock,
-    mooncake_transfer_verify_enabled,
     sync_device_after_remote_kv_write,
 )
 from vllm.distributed.parallel_state import (
@@ -848,7 +847,7 @@ class MooncakeConnectorWorker:
         self.xfer_stats = MooncakeKVConnectorStats()
 
         self._transfer_verifier: MooncakeTransferVerifier | None = None
-        if self.is_kv_producer and mooncake_transfer_verify_enabled():
+        if self.is_kv_producer:
             self._transfer_verifier = MooncakeTransferVerifier(
                 self.engine, torch.device(f"cuda:{self.device_id}")
             )

@@ -3,9 +3,9 @@
 """RDMA transfer visibility guards for MooncakeConnector PD transfers.
 
 RDMA one-sided writes can return to the sender before the payload is visible
-in the remote GPU's HBM. Under concurrent batch transfers to the same remote
-session, completion ordering is also not guaranteed unless transfers are
-serialized. These helpers address both issues.
+in the remote GPU's HBM, and concurrent writes to the same remote session may
+race. The producer serializes writes per remote session and reads back both
+ends of every descriptor until the remote bytes match the local source.
 """
 
 from __future__ import annotations
@@ -16,7 +16,6 @@ from typing import TYPE_CHECKING
 
 import torch
 
-from vllm import envs
 from vllm.logger import init_logger
 
 try:
@@ -29,10 +28,13 @@ if TYPE_CHECKING:
 
 logger = init_logger(__name__)
 
-# Bytes read back from the tail of each descriptor when verifying visibility.
-_DEFAULT_VERIFY_TAIL_BYTES = 64
-# Upper bound on descriptors per batch_transfer_sync_write call.
-_MAX_DESCRIPTORS_PER_BATCH = 512
+# Bytes checked at both the head and tail of each descriptor. Tail catches
+# truncated writes (NIC-to-HBM gap); head catches front-overwrite races.
+_VERIFY_EDGE_BYTES = 64
+# Read-back segments verified per round-trip (bounds the scratch buffer).
+_VERIFY_SEGMENTS_PER_BATCH = 1024
+_VERIFY_MAX_RETRIES = 500
+_VERIFY_RETRY_SLEEP_S = 0.001
 
 _session_locks: dict[str, threading.Lock] = {}
 _session_locks_guard = threading.Lock()
@@ -48,33 +50,19 @@ def get_remote_session_lock(remote_session: str) -> threading.Lock:
         return lock
 
 
-def mooncake_transfer_verify_enabled() -> bool:
-    return envs.VLLM_MOONCAKE_TRANSFER_VERIFY
-
-
-def _verify_tail_bytes() -> int:
-    return envs.VLLM_MOONCAKE_TRANSFER_VERIFY_TAIL_BYTES
-
-
-def _verify_max_retries() -> int:
-    return envs.VLLM_MOONCAKE_TRANSFER_VERIFY_MAX_RETRIES
-
-
-def _verify_retry_sleep_s() -> float:
-    return envs.VLLM_MOONCAKE_TRANSFER_VERIFY_RETRY_SLEEP_S
-
-
 class MooncakeTransferVerifier:
-    """Verify remote GPU visibility via RDMA read-back of descriptor tails."""
+    """Verify remote GPU visibility via RDMA read-back of descriptor edges."""
 
     def __init__(self, engine: TransferEngine, device: torch.device) -> None:
         self.engine = engine
         self.device = device
-        tail_bytes = _verify_tail_bytes()
-        scratch_bytes = 2 * _MAX_DESCRIPTORS_PER_BATCH * tail_bytes
-        self._scratch = torch.empty(scratch_bytes, dtype=torch.uint8, device=device)
+        # Serializes access to the shared scratch buffers across sender threads.
+        self._lock = threading.Lock()
+        cap = _VERIFY_SEGMENTS_PER_BATCH * _VERIFY_EDGE_BYTES
+        self._read_buf = torch.empty(cap, dtype=torch.uint8, device=device)
+        self._expected_buf = torch.empty(cap, dtype=torch.uint8, device=device)
         ret = self.engine.batch_register_memory(
-            [self._scratch.data_ptr()], [self._scratch.nbytes]
+            [self._read_buf.data_ptr()], [self._read_buf.nbytes]
         )
         if ret != 0:
             raise RuntimeError("Mooncake verifier scratch buffer registration failed.")
@@ -86,68 +74,63 @@ class MooncakeTransferVerifier:
         dst_ptrs: list[int],
         lengths: list[int],
     ) -> bool:
-        """Poll until remote tails match local source tails, or retries exhaust."""
-        if not src_ptrs:
+        """Poll until remote descriptor edges match local source, else fail."""
+        edge = _VERIFY_EDGE_BYTES
+        # (local_src_ptr, remote_dst_ptr, seg_len) for each edge to compare.
+        segments: list[tuple[int, int, int]] = []
+        for src, dst, length in zip(src_ptrs, dst_ptrs, lengths):
+            if length <= 2 * edge:
+                segments.append((src, dst, length))
+            else:
+                segments.append((src, dst, edge))
+                segments.append((src + length - edge, dst + length - edge, edge))
+        if not segments:
             return True
 
-        tail_bytes = _verify_tail_bytes()
-        check_lens: list[int] = []
-        local_src_tails: list[int] = []
-        remote_dst_tails: list[int] = []
-        for src, dst, length in zip(src_ptrs, dst_ptrs, lengths):
-            check_len = min(length, tail_bytes)
-            check_lens.append(check_len)
-            local_src_tails.append(src + length - check_len)
-            remote_dst_tails.append(dst + length - check_len)
+        with self._lock:
+            for i in range(0, len(segments), _VERIFY_SEGMENTS_PER_BATCH):
+                batch = segments[i : i + _VERIFY_SEGMENTS_PER_BATCH]
+                if not self._verify_batch(remote_session, batch):
+                    logger.error(
+                        "Mooncake transfer remote visibility not confirmed after "
+                        "%d retries (%d descriptors, session=%s)",
+                        _VERIFY_MAX_RETRIES,
+                        len(src_ptrs),
+                        remote_session,
+                    )
+                    return False
+        return True
 
-        max_retries = _verify_max_retries()
-        retry_sleep = _verify_retry_sleep_s()
-        total_bytes = sum(check_lens)
-        read_buf = self._scratch[:total_bytes]
-        expected_buf = self._scratch[total_bytes : 2 * total_bytes]
+    def _verify_batch(
+        self, remote_session: str, segments: list[tuple[int, int, int]]
+    ) -> bool:
+        check_lens = [seg_len for _, _, seg_len in segments]
+        remote_ptrs = [dst for _, dst, _ in segments]
+        total = sum(check_lens)
+        read_buf = self._read_buf[:total]
+        expected_buf = self._expected_buf[:total]
 
         read_ptrs: list[int] = []
-        read_offset = 0
-        for check_len in check_lens:
-            read_ptrs.append(read_buf.data_ptr() + read_offset)
-            read_offset += check_len
-
-        expected_offset = 0
-        for src_tail, check_len in zip(local_src_tails, check_lens):
+        offset = 0
+        for src, _, seg_len in segments:
             self._copy_device_to_device(
-                dst_ptr=expected_buf.data_ptr() + expected_offset,
-                src_ptr=src_tail,
-                nbytes=check_len,
+                expected_buf.data_ptr() + offset, src, seg_len
             )
-            expected_offset += check_len
+            read_ptrs.append(read_buf.data_ptr() + offset)
+            offset += seg_len
 
-        for attempt in range(max_retries):
+        for attempt in range(_VERIFY_MAX_RETRIES):
             ret = self.engine.batch_transfer_sync_read(
-                remote_session, read_ptrs, remote_dst_tails, check_lens
+                remote_session, read_ptrs, remote_ptrs, check_lens
             )
-            if ret != 0:
-                logger.warning(
-                    "Mooncake transfer verify read-back failed (ret=%s, attempt=%d)",
-                    ret,
-                    attempt + 1,
-                )
-            elif torch.equal(read_buf, expected_buf):
+            if ret == 0 and torch.equal(read_buf, expected_buf):
                 if attempt > 0:
                     logger.debug(
-                        "Mooncake transfer remote visibility confirmed after %d retries",
+                        "Mooncake transfer visibility confirmed after %d retries",
                         attempt + 1,
                     )
                 return True
-
-            time.sleep(retry_sleep)
-
-        logger.error(
-            "Mooncake transfer remote visibility not confirmed after %d retries "
-            "(%d descriptors, session=%s)",
-            max_retries,
-            len(src_ptrs),
-            remote_session,
-        )
+            time.sleep(_VERIFY_RETRY_SLEEP_S)
         return False
 
     @staticmethod
@@ -163,5 +146,5 @@ class MooncakeTransferVerifier:
 
 
 def sync_device_after_remote_kv_write(device: torch.device) -> None:
-    """Ensure the local GPU observes completed remote RDMA writes."""
+    """Flush local GPU work before the decoder consumes received KV."""
     torch.cuda.synchronize(device=device)

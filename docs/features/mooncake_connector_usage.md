@@ -48,19 +48,6 @@ Now you can send requests to the proxy server through port 8000.
     - Default: 480
     - If a request is aborted and the decoder has not yet notified the prefiller, the prefill instance will release its KV-cache blocks after this timeout to avoid holding them indefinitely.
 
-- `VLLM_MOONCAKE_TRANSFER_VERIFY`: Enable RDMA read-back verification on the prefiller before acknowledging KV transfers to decoders. (Optional)
-    - Default: true
-    - Prefill workers poll the tail of each transferred descriptor via `batch_transfer_sync_read` until the remote GPU memory matches the local source. This closes the NIC-to-HBM visibility gap of one-sided RDMA writes under PD load.
-
-- `VLLM_MOONCAKE_TRANSFER_VERIFY_TAIL_BYTES`: Tail bytes checked per descriptor during transfer verification. (Optional)
-    - Default: 64
-
-- `VLLM_MOONCAKE_TRANSFER_VERIFY_MAX_RETRIES`: Maximum read-back polling attempts per transfer batch. (Optional)
-    - Default: 500
-
-- `VLLM_MOONCAKE_TRANSFER_VERIFY_RETRY_SLEEP_S`: Sleep interval between read-back retries, in seconds. (Optional)
-    - Default: 0.001
-
 ## KV Transfer Config
 
 ### KV Role Options
