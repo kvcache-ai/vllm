@@ -8,7 +8,9 @@ import torch
 
 from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.transfer_guard import (
     _VERIFY_EDGE_BYTES,
+    _VERIFY_SCRATCH_BYTES,
     MooncakeTransferVerifier,
+    _batch_segments_by_bytes,
     get_remote_session_lock,
 )
 
@@ -78,3 +80,46 @@ class TestMooncakeTransferVerifier:
         assert not verifier.verify_remote_visibility(
             "remote:1", [src.data_ptr()], [0x1000], [2 * _VERIFY_EDGE_BYTES]
         )
+
+
+class TestBatchSegmentsByBytes:
+    def test_splits_by_byte_budget(self):
+        seg = (0, 0, 128)
+        segments = [seg] * 600
+        batches = _batch_segments_by_bytes(segments, _VERIFY_SCRATCH_BYTES)
+        assert len(batches) >= 2
+        assert all(
+            sum(s[2] for s in batch) <= _VERIFY_SCRATCH_BYTES for batch in batches
+        )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+class TestMooncakeTransferVerifierManySegments:
+    def test_many_small_segments_use_multiple_read_batches(self):
+        engine = MagicMock()
+        engine.batch_register_memory.return_value = 0
+        verifier = MooncakeTransferVerifier(engine, torch.device("cuda"))
+
+        length = 128
+        src = torch.arange(length, dtype=torch.uint8, device="cuda")
+        n = 600
+        src_ptrs = [src.data_ptr()] * n
+        dst_ptrs = [0x3000 + i * length for i in range(n)]
+        lengths = [length] * n
+        read_calls = {"count": 0}
+
+        def fake_read(session, read_ptrs, remote_ptrs, lengths):
+            del session, remote_ptrs
+            read_calls["count"] += 1
+            for read_ptr, seg_len in zip(read_ptrs, lengths):
+                MooncakeTransferVerifier._copy_device_to_device(
+                    read_ptr, src.data_ptr(), seg_len
+                )
+            return 0
+
+        engine.batch_transfer_sync_read.side_effect = fake_read
+
+        assert verifier.verify_remote_visibility(
+            "remote:1", src_ptrs, dst_ptrs, lengths
+        )
+        assert read_calls["count"] >= 2

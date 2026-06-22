@@ -847,7 +847,7 @@ class MooncakeConnectorWorker:
         self.xfer_stats = MooncakeKVConnectorStats()
 
         self._transfer_verifier: MooncakeTransferVerifier | None = None
-        if self.is_kv_producer:
+        if not self.is_kv_consumer:
             self._transfer_verifier = MooncakeTransferVerifier(
                 self.engine, torch.device(f"cuda:{self.device_id}")
             )

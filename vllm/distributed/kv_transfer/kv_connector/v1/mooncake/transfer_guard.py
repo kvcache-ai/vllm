@@ -31,8 +31,8 @@ logger = init_logger(__name__)
 # Bytes checked at both the head and tail of each descriptor. Tail catches
 # truncated writes (NIC-to-HBM gap); head catches front-overwrite races.
 _VERIFY_EDGE_BYTES = 64
-# Read-back segments verified per round-trip (bounds the scratch buffer).
-_VERIFY_SEGMENTS_PER_BATCH = 1024
+# Read-back scratch buffer size (bytes) for one batch_transfer_sync_read call.
+_VERIFY_SCRATCH_BYTES = 64 * 1024
 _VERIFY_MAX_RETRIES = 500
 _VERIFY_RETRY_SLEEP_S = 0.001
 
@@ -58,9 +58,13 @@ class MooncakeTransferVerifier:
         self.device = device
         # Serializes access to the shared scratch buffers across sender threads.
         self._lock = threading.Lock()
-        cap = _VERIFY_SEGMENTS_PER_BATCH * _VERIFY_EDGE_BYTES
-        self._read_buf = torch.empty(cap, dtype=torch.uint8, device=device)
-        self._expected_buf = torch.empty(cap, dtype=torch.uint8, device=device)
+        self._scratch_bytes = _VERIFY_SCRATCH_BYTES
+        self._read_buf = torch.empty(
+            self._scratch_bytes, dtype=torch.uint8, device=device
+        )
+        self._expected_buf = torch.empty(
+            self._scratch_bytes, dtype=torch.uint8, device=device
+        )
         ret = self.engine.batch_register_memory(
             [self._read_buf.data_ptr()], [self._read_buf.nbytes]
         )
@@ -88,8 +92,7 @@ class MooncakeTransferVerifier:
             return True
 
         with self._lock:
-            for i in range(0, len(segments), _VERIFY_SEGMENTS_PER_BATCH):
-                batch = segments[i : i + _VERIFY_SEGMENTS_PER_BATCH]
+            for batch in _batch_segments_by_bytes(segments, self._scratch_bytes):
                 if not self._verify_batch(remote_session, batch):
                     logger.error(
                         "Mooncake transfer remote visibility not confirmed after "
@@ -107,6 +110,9 @@ class MooncakeTransferVerifier:
         check_lens = [seg_len for _, _, seg_len in segments]
         remote_ptrs = [dst for _, dst, _ in segments]
         total = sum(check_lens)
+        assert total <= self._scratch_bytes, (
+            f"verify batch size {total} exceeds scratch {self._scratch_bytes}"
+        )
         read_buf = self._read_buf[:total]
         expected_buf = self._expected_buf[:total]
 
@@ -123,13 +129,15 @@ class MooncakeTransferVerifier:
             ret = self.engine.batch_transfer_sync_read(
                 remote_session, read_ptrs, remote_ptrs, check_lens
             )
-            if ret == 0 and torch.equal(read_buf, expected_buf):
-                if attempt > 0:
-                    logger.debug(
-                        "Mooncake transfer visibility confirmed after %d retries",
-                        attempt + 1,
-                    )
-                return True
+            if ret == 0:
+                torch.cuda.synchronize(device=self.device)
+                if torch.equal(read_buf, expected_buf):
+                    if attempt > 0:
+                        logger.debug(
+                            "Mooncake transfer visibility confirmed after %d retries",
+                            attempt + 1,
+                        )
+                    return True
             time.sleep(_VERIFY_RETRY_SLEEP_S)
         return False
 
@@ -143,6 +151,32 @@ class MooncakeTransferVerifier:
         )[0]
         if err != 0:
             raise RuntimeError(f"cudaMemcpy D2D failed with error code {err}")
+
+
+def _batch_segments_by_bytes(
+    segments: list[tuple[int, int, int]], max_bytes: int
+) -> list[list[tuple[int, int, int]]]:
+    """Split segments so each batch fits in the scratch buffer."""
+    batches: list[list[tuple[int, int, int]]] = []
+    current: list[tuple[int, int, int]] = []
+    current_bytes = 0
+    for src, dst, seg_len in segments:
+        if seg_len > max_bytes:
+            if current:
+                batches.append(current)
+                current = []
+                current_bytes = 0
+            batches.append([(src, dst, seg_len)])
+            continue
+        if current and current_bytes + seg_len > max_bytes:
+            batches.append(current)
+            current = []
+            current_bytes = 0
+        current.append((src, dst, seg_len))
+        current_bytes += seg_len
+    if current:
+        batches.append(current)
+    return batches
 
 
 def sync_device_after_remote_kv_write(device: torch.device) -> None:
