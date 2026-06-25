@@ -911,13 +911,6 @@ class MooncakeConnectorWorker:
 
         self.xfer_stats = MooncakeKVConnectorStats()
 
-        # SGLang-aligned dead-session tracking: a single nonzero return from
-        # ``batch_transfer_sync_write`` to a remote session marks the session
-        # unusable so subsequent transfers fast-fail instead of repeatedly
-        # hitting the same broken RDMA endpoint. Producer-side only.
-        self._session_lock = threading.Lock()
-        self._failed_sessions: set[str] = set()
-
         self.block_size = vllm_config.cache_config.block_size
         self.model_config = vllm_config.model_config
         self.cache_config = vllm_config.cache_config
@@ -1458,26 +1451,17 @@ class MooncakeConnectorWorker:
         dst_ptrs: list[int],
         lengths: list[int],
     ) -> int:
-        # Fast-fail to a remote session that has already failed once. Matches
-        # SGLang's MooncakeKVManager behavior: a failed session is treated as
-        # dead and not retried, so we don't hammer a broken endpoint.
-        with self._session_lock:
-            if remote_session in self._failed_sessions:
-                logger.warning(
-                    "Skipping transfer to %s: session previously marked failed",
-                    remote_session,
-                )
-                self.xfer_stats.record_failed_transfer()
-                return -1
-
+        # Trust ``batch_transfer_sync_write``'s return value to status the
+        # transfer. The caller propagates failures by adding the request's
+        # ``req_id`` (rid) to ``err_reqs`` in the ZMQ response sent back to
+        # the consumer (see ``send_kv_to_decode``), which is the same
+        # rid-based status pattern SGLang uses
+        # (``sync_status_to_decode_endpoint`` with ``bootstrap_room``).
         start_time = time.perf_counter()
         ret_value = self.engine.batch_transfer_sync_write(
             remote_session, src_ptrs, dst_ptrs, lengths
         )
         duration = time.perf_counter() - start_time
-        if ret_value != 0:
-            with self._session_lock:
-                self._failed_sessions.add(remote_session)
         if ret_value == 0:
             self.xfer_stats.record_transfer(
                 duration_s=duration,
