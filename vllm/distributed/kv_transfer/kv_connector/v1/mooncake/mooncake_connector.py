@@ -39,11 +39,6 @@ from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.mooncake_utils import
 from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.stats import (
     MooncakeKVConnectorStats,
 )
-from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.transfer_guard import (
-    MooncakeTransferVerifier,
-    get_remote_session_lock,
-    sync_device_after_remote_kv_write,
-)
 from vllm.distributed.parallel_state import (
     get_pp_group,
     get_tensor_model_parallel_rank,
@@ -916,11 +911,12 @@ class MooncakeConnectorWorker:
 
         self.xfer_stats = MooncakeKVConnectorStats()
 
-        self._transfer_verifier: MooncakeTransferVerifier | None = None
-        if not self.is_kv_consumer:
-            self._transfer_verifier = MooncakeTransferVerifier(
-                self.engine, torch.device(f"cuda:{self.device_id}")
-            )
+        # SGLang-aligned dead-session tracking: a single nonzero return from
+        # ``batch_transfer_sync_write`` to a remote session marks the session
+        # unusable so subsequent transfers fast-fail instead of repeatedly
+        # hitting the same broken RDMA endpoint. Producer-side only.
+        self._session_lock = threading.Lock()
+        self._failed_sessions: set[str] = set()
 
         self.block_size = vllm_config.cache_config.block_size
         self.model_config = vllm_config.model_config
@@ -1462,17 +1458,26 @@ class MooncakeConnectorWorker:
         dst_ptrs: list[int],
         lengths: list[int],
     ) -> int:
+        # Fast-fail to a remote session that has already failed once. Matches
+        # SGLang's MooncakeKVManager behavior: a failed session is treated as
+        # dead and not retried, so we don't hammer a broken endpoint.
+        with self._session_lock:
+            if remote_session in self._failed_sessions:
+                logger.warning(
+                    "Skipping transfer to %s: session previously marked failed",
+                    remote_session,
+                )
+                self.xfer_stats.record_failed_transfer()
+                return -1
+
         start_time = time.perf_counter()
-        with get_remote_session_lock(remote_session):
-            ret_value = self.engine.batch_transfer_sync_write(
-                remote_session, src_ptrs, dst_ptrs, lengths
-            )
-            if ret_value == 0 and self._transfer_verifier is not None:
-                if not self._transfer_verifier.verify_remote_visibility(
-                    remote_session, src_ptrs, dst_ptrs, lengths
-                ):
-                    ret_value = -1
+        ret_value = self.engine.batch_transfer_sync_write(
+            remote_session, src_ptrs, dst_ptrs, lengths
+        )
         duration = time.perf_counter() - start_time
+        if ret_value != 0:
+            with self._session_lock:
+                self._failed_sessions.add(remote_session)
         if ret_value == 0:
             self.xfer_stats.record_transfer(
                 duration_s=duration,
@@ -1708,11 +1713,6 @@ class MooncakeConnectorWorker:
         pull_metas: dict[ReqId, PullReqMeta],
     ):
         ok_reqs: list[ReqId] = response.ok_reqs or []
-
-        if ok_reqs:
-            sync_device_after_remote_kv_write(
-                torch.device(f"cuda:{self.device_id}")
-            )
 
         for req_id in ok_reqs:
             pull_meta = pull_metas[req_id]
