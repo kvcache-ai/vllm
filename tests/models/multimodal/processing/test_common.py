@@ -416,13 +416,13 @@ def test_processing_correctness(
         pytest.skip("Fix later")
     if model_id == "OpenGVLab/InternVL2-2B":
         pytest.skip("Fix later")
+    if model_id == "openvla/openvla-7b":
+        pytest.skip(
+            "OpenVLA uses a custom vLLM processor because its HF remote "
+            "processor is incompatible with current Transformers."
+        )
     if model_id == "jinaai/jina-reranker-m0":
         pytest.skip("Fix later")
-    if model_id in {"Qwen/Qwen-VL", "Qwen/Qwen-VL-Chat"}:
-        pytest.skip(
-            "Qwen-VL tokenizer requires downloading a font file from "
-            "servers that often refuse connections in CI"
-        )
     if model_id == "mistralai/Voxtral-Mini-4B-Realtime-2602":
         pytest.skip(
             "Voxtral Realtime doesn't make use of any place-holder "
@@ -432,6 +432,12 @@ def test_processing_correctness(
         )
     if model_id == "CohereLabs/cohere-transcribe-03-2026":
         pytest.skip("Fix later")
+    if model_id.startswith("OpenMOSS-Team/MOSS-Audio-"):
+        pytest.skip(
+            "MOSS-Audio uses a custom processor that dynamically expands "
+            "audio placeholders from processed audio lengths. Its vLLM "
+            "processor paths are covered by test_moss_audio.py."
+        )
 
     _test_processing_correctness(
         model_id,

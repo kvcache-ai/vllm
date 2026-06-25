@@ -45,7 +45,8 @@ def _cast_kv_tile(data, Q, tensor_scale, KV_QUANT_MODE: tl.constexpr):
       ``3`` (FP8 per-token-head): plain cast.  Per-token-head modes apply
       their scales separately on S/P inside the loop.
     - ``KV_QUANT_MODE == 1`` (FP8 per-tensor): dequantize using the
-      tensor-wide scale.
+      tensor-wide scale, unless Q is also FP8 and the caller folds the scales
+      into the attention score and output accumulator.
     """
     if KV_QUANT_MODE == 1:
         if Q.dtype.is_fp8():
@@ -191,6 +192,7 @@ def kernel_unified_attention(
     qq_bias_ptr,
     # Scalars
     scale,
+    q_scale,
     k_scale,
     v_scale,
     out_scale,
@@ -213,6 +215,9 @@ def kernel_unified_attention(
     USE_SOFTCAP: tl.constexpr,  # bool
     USE_SINKS: tl.constexpr,  # bool
     SLIDING_WINDOW: tl.constexpr,  # int
+    USE_CAUSAL: tl.constexpr,  # bool
+    USE_PER_SEQ_CAUSAL: tl.constexpr,  # bool
+    per_seq_causal_ptr,  # [num_seqs] bool, or None
     USE_MM_PREFIX: tl.constexpr,  # bool
     MAX_MM_RANGES: tl.constexpr,  # int
     mm_prefix_range_ptr,
@@ -254,7 +259,8 @@ def kernel_unified_attention(
     stride_vs_head: tl.int64 = None,
     # KV cache quantization mode handled inside this kernel via constexpr
     # branches: NONE (0), FP8_PER_TENSOR (1), INT8_PER_TOKEN_HEAD (2),
-    # FP8_PER_TOKEN_HEAD (3).
+    # FP8_PER_TOKEN_HEAD (3). Sub-byte INT4 (4) uses its own
+    # int4_per_token_head kernel, not this one.
     KV_QUANT_MODE: tl.constexpr = 0,
     FP8_MIN: tl.constexpr = float8_info.min,
     FP8_MAX: tl.constexpr = float8_info.max,
@@ -268,8 +274,10 @@ def kernel_unified_attention(
     # (see ``unified_attention`` wrapper for the gating rules).
     USE_TD: tl.constexpr = False,
     USE_TD_QO: tl.constexpr = False,
+    Q_IS_FP8: tl.constexpr = False,
 ):
     USE_PER_TOKEN_HEAD_SCALES: tl.constexpr = KV_QUANT_MODE >= 2
+    USE_FP8_Q_DESCALE: tl.constexpr = KV_QUANT_MODE == 1 and Q_IS_FP8
 
     if USE_TD:
         tl.static_assert(
@@ -355,6 +363,11 @@ def kernel_unified_attention(
     L = tl.full([BLOCK_M], 1.0, dtype=tl.float32)
     # acc : (BLOCK_M, HEAD_SIZE_PADDED)
     acc = tl.zeros([BLOCK_M, HEAD_SIZE_PADDED], dtype=tl.float32)
+    score_scale = scale
+    value_scale = 1.0
+    if USE_FP8_Q_DESCALE:
+        score_scale = scale * tl.load(q_scale) * tl.load(k_scale)
+        value_scale = tl.load(v_scale)
 
     context_len = seq_len - cur_batch_query_len
 
@@ -380,6 +393,8 @@ def kernel_unified_attention(
         SLIDING_WINDOW,
         USE_MM_PREFIX,
         IS_3D,
+        USE_CAUSAL,
+        USE_PER_SEQ_CAUSAL,
         CHUNK_LOOKBACK,
         CHUNK_SIZE,
     )
@@ -484,10 +499,14 @@ def kernel_unified_attention(
             query_abs_pos,
             seq_offset,
             seq_idx,
+            seq_len,
             mm_prefix_range_ptr,
             SLIDING_WINDOW,
             USE_MM_PREFIX,
             MAX_MM_RANGES,
+            USE_CAUSAL,
+            USE_PER_SEQ_CAUSAL,
+            per_seq_causal_ptr,
             CHUNK_LOOKBACK,
             CHUNK_SIZE,
         )
@@ -497,9 +516,9 @@ def kernel_unified_attention(
         if USE_PER_TOKEN_HEAD_SCALES:
             # Per-token-head quant: fuse softmax_scale with per-head k_scale
             # to avoid a separate BLOCK_M × TILE_SIZE multiply on S.
-            S += tl.dot(Q, K) * (scale * k_token_head_scales[None, :])
+            S += tl.dot(Q, K) * (score_scale * k_token_head_scales[None, :])
         else:
-            S += scale * tl.dot(Q, K)
+            S += score_scale * tl.dot(Q, K)
 
         if USE_SOFTCAP:
             S = apply_softcap(S, softcap)
@@ -523,11 +542,19 @@ def kernel_unified_attention(
 
         if SLIDING_WINDOW:
             qpos_lo = q_block_local_idx * BLOCK_Q
-            V = tl.where(
-                (context_len + qpos_lo - seq_offset[:, None]) < SLIDING_WINDOW,
-                V,
-                0.0,
-            )
+            dist = context_len + qpos_lo - seq_offset[:, None]
+            if USE_PER_SEQ_CAUSAL:
+                is_causal_seq = tl.load(per_seq_causal_ptr + seq_idx)
+                sw_mask_v = tl.where(
+                    is_causal_seq,
+                    dist < SLIDING_WINDOW,
+                    (dist < SLIDING_WINDOW) & (dist > -SLIDING_WINDOW),
+                )
+            elif USE_CAUSAL:
+                sw_mask_v = dist < SLIDING_WINDOW
+            else:
+                sw_mask_v = (dist < SLIDING_WINDOW) & (dist > -SLIDING_WINDOW)
+            V = tl.where(sw_mask_v, V, 0.0)
         if USE_PER_TOKEN_HEAD_SCALES:
             # Per-token-head quant: apply v_scale to P instead of V.
             P_v = (P * v_token_head_scales[None, :]).to(V.dtype)
@@ -537,6 +564,8 @@ def kernel_unified_attention(
 
     # ---- Epilogue ---------------------------------------------------------
     if IS_3D:
+        if USE_FP8_Q_DESCALE:
+            acc *= value_scale
         # Store per-segment partials; finalized by ``reduce_segments``.
         if USE_TD_QO:
             # 3D target: segm_output[token, head, segm_idx, :].  Advance
@@ -592,6 +621,8 @@ def kernel_unified_attention(
         )
     else:
         acc = acc / L[:, None]
+        if USE_FP8_Q_DESCALE:
+            acc *= value_scale
         if USE_FP8:
             acc = acc * tl.load(out_scale)
             acc = tl.clamp(acc, FP8_MIN, FP8_MAX)
@@ -789,8 +820,51 @@ def unified_attention(
     # disabling this flag costs nothing.
     use_td: bool = False,
 ):
-    assert causal, "Only causal attention is supported"
-    assert q_descale is None, "Q scales not supported"
+    # Resolve causal: bool or per-seq tensor.
+    use_per_seq_causal = isinstance(causal, torch.Tensor)
+    use_causal = bool(causal) if not use_per_seq_causal else True
+    per_seq_causal_ptr = causal if use_per_seq_causal else None
+
+    # Sub-byte packed mode (INT4) needs a bespoke kernel (split-dot +
+    # sub-byte unpack); everything else goes through the core kernel below.
+    if kv_quant_mode == KVQuantMode.INT4_PER_TOKEN_HEAD:
+        assert use_causal and not use_per_seq_causal, (
+            "INT4_PER_TOKEN_HEAD only supports causal attention"
+        )
+        from vllm.v1.attention.ops.int4_per_token_head import (
+            unified_attention_int4,
+        )
+
+        if sinks is not None:
+            assert sinks.shape[0] == q.shape[1], "Sinks must be num_query_heads size"
+        unified_attention_int4(
+            q=q,
+            k_cache=k,
+            v_cache=v,
+            out=out,
+            cu_seqlens_q=cu_seqlens_q,
+            max_seqlen_q=max_seqlen_q,
+            seqused_k=seqused_k,
+            max_seqlen_k=max_seqlen_k,
+            softmax_scale=softmax_scale,
+            window_size=window_size,
+            block_table=block_table,
+            softcap=softcap,
+            sinks=sinks,
+            alibi_slopes=alibi_slopes,
+            use_alibi_sqrt=use_alibi_sqrt,
+            qq_bias=qq_bias,
+            output_scale=output_scale,
+            mm_prefix_range=mm_prefix_range,
+            k_scale_cache=k_scale_cache,
+            v_scale_cache=v_scale_cache,
+            seq_threshold_3D=seq_threshold_3D,
+            num_par_softmax_segments=num_par_softmax_segments,
+            softmax_segm_output=softmax_segm_output,
+            softmax_segm_max=softmax_segm_max,
+            softmax_segm_expsum=softmax_segm_expsum,
+        )
+        return
 
     if sinks is not None:
         assert sinks.shape[0] == q.shape[1], "Sinks must be num_query_heads size"
@@ -830,6 +904,26 @@ def unified_attention(
     )
     BLOCK_Q = BLOCK_M // num_queries_per_kv
 
+    # Tuned launch parameters; ``None`` lets Triton pick its defaults.
+    launch_num_warps: int | None = None
+    launch_num_stages: int | None = None
+
+    # head_size 256 with many query rows per sequence (e.g. diffusion-gemma
+    # bidirectional canvas passes) is prefill-shaped, but the decode-oriented
+    # defaults (BLOCK_Q=8, TILE=32, 4 warps) under-tile it. A wider KV tile +
+    # more query rows per block + 8 warps is ~2x faster on B200.
+    tuned_large_head = (
+        head_size == 256
+        and max_seqlen_q > 1
+        and num_queries_per_kv <= 16
+        and current_platform.is_device_capability_family(100)
+    )
+    if tuned_large_head:
+        BLOCK_M = 32
+        BLOCK_Q = BLOCK_M // num_queries_per_kv
+        launch_num_warps = 8
+        launch_num_stages = 2
+
     # Ideally we would launch with kernel with:
     # \sum_i[ceil(query_len[i] / BLOCK_Q)] blocks.
     # However, it is slow to realize the query_lens on cpu.
@@ -857,6 +951,11 @@ def unified_attention(
     TILE_SIZE_DECODE = _get_tile_size(
         head_size, sliding_window_val, q.element_size(), is_prefill=False
     )
+
+    # Wider KV tile for the tuned large-head path (see above). Only the 2D
+    # path (used when max_seqlen_q > 1) reads TILE_SIZE_PREFILL.
+    if tuned_large_head:
+        TILE_SIZE_PREFILL = 128
 
     # USE_TD requires BLOCK_SIZE % TILE_SIZE == 0 (enforced by a
     # ``tl.static_assert`` in the kernel).  The default prefill tile
@@ -938,7 +1037,6 @@ def unified_attention(
         # Pass the K cache as a stand-in pointer; never dereferenced.
         k_scale_ptr = k
         v_scale_ptr = v
-
     # 3D needs real segm tensors; 2D never touches them but Triton wants
     # a non-null pointer.  Reuse ``out`` as the placeholder.
     segm_output_ptr = softmax_segm_output if use_3d else out
@@ -953,6 +1051,12 @@ def unified_attention(
     else:
         grid = (total_num_q_blocks, num_kv_heads, num_par_softmax_segments)
         tile_size = TILE_SIZE_DECODE
+
+    launch_kwargs: dict[str, int] = {}
+    if launch_num_warps is not None:
+        launch_kwargs["num_warps"] = launch_num_warps
+    if launch_num_stages is not None:
+        launch_kwargs["num_stages"] = launch_num_stages
 
     kernel_unified_attention[grid](
         output_ptr=out,
@@ -970,6 +1074,7 @@ def unified_attention(
         k_scale_cache_ptr=k_scale_ptr,
         v_scale_cache_ptr=v_scale_ptr,
         scale=softmax_scale,
+        q_scale=q_descale,
         k_scale=k_descale,
         v_scale=v_descale,
         out_scale=1 / output_scale if output_scale is not None else 1.0,
@@ -991,10 +1096,13 @@ def unified_attention(
         USE_QQ_BIAS=use_qq_bias,
         USE_SOFTCAP=(softcap > 0),
         USE_SINKS=(sinks is not None),
+        SLIDING_WINDOW=(1 + window_size[0]),
+        USE_CAUSAL=use_causal,
+        USE_PER_SEQ_CAUSAL=use_per_seq_causal,
+        per_seq_causal_ptr=per_seq_causal_ptr,
         USE_MM_PREFIX=use_mm_prefix,
         MAX_MM_RANGES=max_mm_ranges,
         mm_prefix_range_ptr=mm_prefix_range,
-        SLIDING_WINDOW=(1 + window_size[0]),
         stride_k_cache_0=k.stride(0),
         stride_k_cache_1=k.stride(1),
         stride_k_cache_2=k.stride(2),
@@ -1017,10 +1125,12 @@ def unified_attention(
         USE_FP8=output_scale is not None,
         IS_3D=use_3d,
         KV_QUANT_MODE=kv_quant_mode,
+        Q_IS_FP8=(q.dtype == current_platform.fp8_dtype()),
         CHUNK_LOOKBACK=chunk_lookback,
         CHUNK_SIZE=chunk_size,
         USE_TD=use_td,
         USE_TD_QO=use_td_qo,
+        **launch_kwargs,
     )
 
     if use_3d:
