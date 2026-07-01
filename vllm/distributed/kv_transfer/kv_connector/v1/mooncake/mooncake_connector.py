@@ -32,6 +32,11 @@ from vllm.distributed.kv_transfer.kv_connector.v1.base import (
     SupportsHMA,
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.metrics import KVConnectorStats
+from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.arrival_doorbell import (
+    ARRIVAL_SLOT_BYTES,
+    ArrivalDoorbell,
+    NoncePad,
+)
 from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.mooncake_utils import (
     MooncakeBootstrapServer,
     RegisterWorkerPayload,
@@ -334,6 +339,16 @@ class MooncakeXferMetadata(
     block_lens: list[int]
     registered_layer_names: list[str] = msgspec.field(default_factory=list)
     registered_layer_indices: list[int] = msgspec.field(default_factory=list)
+    # SGLang-style rid-based arrival doorbell, keyed by D-side req_id.
+    # Each value is ``(slot_addr_on_consumer_gpu, expected_nonce)``. The
+    # producer stages the nonce into a local scratch buffer and appends
+    # a tiny RDMA-write descriptor that targets ``slot_addr`` at the
+    # tail of the batch. The consumer reads its own slot after ``ok_reqs``
+    # arrives -- a matching nonce proves both the doorbell and (by RDMA
+    # WRITE ordering on the same session/region) the preceding KV
+    # descriptors landed in remote HBM. ``None`` keeps backward wire-
+    # compatibility with peers that don't implement the doorbell yet.
+    doorbells: dict[ReqId, tuple[int, int]] | None = None
 
 
 class MooncakeXferResponseStatus(IntEnum):
@@ -869,6 +884,24 @@ class MooncakeConnectorWorker:
         self.device_kv_caches: dict[str, torch.Tensor] = {}
         self.reqs_need_send: dict[TransferId, SendBlockMeta] = {}
 
+        # SGLang-style per-request arrival doorbell (rid -> nonce). The
+        # consumer owns the slot pool; the producer owns the staging pad.
+        # Roles with ``kv_both`` participate on both sides.
+        doorbell_capacity = int(
+            kv_transfer_config.kv_connector_extra_config.get("doorbell_capacity", 4096)
+        )
+        self._device = torch.device("cuda", self.device_id)
+        self._arrival_doorbell: ArrivalDoorbell | None = None
+        self._nonce_pad: NoncePad | None = None
+        if not self.is_kv_producer:
+            self._arrival_doorbell = ArrivalDoorbell(
+                self.engine, self._device, capacity=doorbell_capacity
+            )
+        if not self.is_kv_consumer:
+            self._nonce_pad = NoncePad(
+                self.engine, self._device, capacity=doorbell_capacity
+            )
+
         # For kv_both, we will act both prefiller and decoder.
         if not self.is_kv_consumer:
             # Background threads for sending kvcaches to D.
@@ -1212,6 +1245,30 @@ class MooncakeConnectorWorker:
                 if d_req_id not in err_req_set
             ]
 
+            # Append rid-tagged arrival-doorbell descriptors to the batch.
+            # Each one is a tiny RDMA write that the consumer reads back
+            # after ``ok_reqs`` arrives -- a matching nonce proves the
+            # preceding KV writes on this session/region landed in HBM.
+            if (
+                src_ptrs
+                and ok_ready_reqs
+                and self._nonce_pad is not None
+                and meta.doorbells
+            ):
+                doorbell_pairs: list[tuple[ReqId, tuple[int, int]]] = [
+                    (d_req_id, meta.doorbells[d_req_id])
+                    for d_req_id, _ in ok_ready_reqs
+                    if d_req_id in meta.doorbells
+                ]
+                if doorbell_pairs:
+                    nonces = [pair[1][1] for pair in doorbell_pairs]
+                    dst_slot_addrs = [pair[1][0] for pair in doorbell_pairs]
+                    src_slot_addrs = self._nonce_pad.stage(nonces)
+                    for src, dst in zip(src_slot_addrs, dst_slot_addrs):
+                        src_ptrs.append(src)
+                        dst_ptrs.append(dst)
+                        lengths.append(ARRIVAL_SLOT_BYTES)
+
             if src_ptrs:
                 remote_session = f"{meta.remote_hostname}:{meta.remote_port}"
                 ret_value = await self.sender_loop.run_in_executor(
@@ -1451,12 +1508,14 @@ class MooncakeConnectorWorker:
         dst_ptrs: list[int],
         lengths: list[int],
     ) -> int:
-        # Trust ``batch_transfer_sync_write``'s return value to status the
-        # transfer. The caller propagates failures by adding the request's
-        # ``req_id`` (rid) to ``err_reqs`` in the ZMQ response sent back to
-        # the consumer (see ``send_kv_to_decode``), which is the same
-        # rid-based status pattern SGLang uses
-        # (``sync_status_to_decode_endpoint`` with ``bootstrap_room``).
+        # The batch ``src_ptrs``/``dst_ptrs``/``lengths`` already include
+        # the per-req arrival-doorbell descriptors appended by
+        # ``send_kv_to_decode`` (when the consumer supplied
+        # ``MooncakeXferMetadata.doorbells``). Their rid-tagged nonces
+        # are validated on the consumer in ``process_pulling_result``;
+        # this mirrors SGLang's ``bootstrap_room`` arrival proof while
+        # keeping vLLM's existing ``ok_reqs``/``err_reqs`` ZMQ channel
+        # as the carrier for per-request status.
         start_time = time.perf_counter()
         ret_value = self.engine.batch_transfer_sync_write(
             remote_session, src_ptrs, dst_ptrs, lengths
@@ -1637,6 +1696,37 @@ class MooncakeConnectorWorker:
         pull_metas: dict[ReqId, PullReqMeta],
     ):
         req_ids = set(pull_metas)
+
+        # Allocate per-(worker, req) arrival-doorbell slots. ``worker_addr``
+        # may exhaust the pool if there are too many in-flight transfers;
+        # in that case we fall back to no-doorbell semantics (slightly
+        # weaker arrival proof) rather than failing the request.
+        doorbells: dict[ReqId, tuple[int, int]] | None = None
+        doorbell_req_ids: list[ReqId] = []
+        if self._arrival_doorbell is not None:
+            doorbells = {}
+            for req_id in pull_metas:
+                # Tag the slot key with the producer worker addr so the
+                # same req can be in-flight to multiple P workers
+                # concurrently without colliding on the same slot.
+                slot_key = f"{req_id}@{worker_addr}"
+                try:
+                    handle = self._arrival_doorbell.allocate(slot_key)
+                except RuntimeError as e:
+                    logger.warning(
+                        "Arrival doorbell pool exhausted for %s: %s -- "
+                        "falling back to ok_reqs-only signalling.",
+                        slot_key,
+                        e,
+                    )
+                    for k in doorbell_req_ids:
+                        self._arrival_doorbell.release(f"{k}@{worker_addr}")
+                    doorbell_req_ids = []
+                    doorbells = None
+                    break
+                doorbell_req_ids.append(req_id)
+                doorbells[req_id] = (handle.slot_addr, handle.expected_nonce)
+
         metadata = MooncakeXferMetadata(
             remote_hostname=self.hostname,
             remote_port=self.rpc_port,
@@ -1650,6 +1740,7 @@ class MooncakeConnectorWorker:
             block_lens=self.block_len_per_layer,
             registered_layer_names=self.registered_layer_names,
             registered_layer_indices=self.registered_layer_indices,
+            doorbells=doorbells,
         )
 
         encoded_data = self._encoder.encode(metadata)
@@ -1660,7 +1751,6 @@ class MooncakeConnectorWorker:
             "Sending kv transfer request for %s on path: %s", req_ids, worker_addr
         )
 
-        # Send query for the request.
         try:
             with make_zmq_socket(
                 self.async_zmq_ctx, worker_addr, zmq.DEALER, bind=False, linger=0
@@ -1681,7 +1771,9 @@ class MooncakeConnectorWorker:
                         )
                         self.xfer_stats.record_failed_recv()
                         return
-                    self.process_pulling_result(response, pull_metas)
+                    self.process_pulling_result(
+                        response, pull_metas, worker_addr=worker_addr
+                    )
                     if response.status == MooncakeXferResponseStatus.FINISH:
                         break
         except zmq.ContextTerminated:
@@ -1690,13 +1782,38 @@ class MooncakeConnectorWorker:
             logger.error("MooncakeXferMetadata transfer failed for %s: %s", req_ids, e)
             self.xfer_stats.record_failed_recv()
             return
+        finally:
+            if self._arrival_doorbell is not None:
+                for req_id in doorbell_req_ids:
+                    self._arrival_doorbell.release(f"{req_id}@{worker_addr}")
 
     def process_pulling_result(
         self,
         response: MooncakeXferResponse,
         pull_metas: dict[ReqId, PullReqMeta],
+        worker_addr: str | None = None,
     ):
-        ok_reqs: list[ReqId] = response.ok_reqs or []
+        raw_ok_reqs: list[ReqId] = response.ok_reqs or []
+
+        # Filter ok_reqs by the arrival doorbell. A missing doorbell entry
+        # (consumer-side pool exhausted, or peer running an older
+        # protocol) is treated as "trust ok_reqs" so we degrade
+        # gracefully; a present-but-mismatched slot demotes the req so
+        # the scheduler retries instead of running with corrupt KV.
+        ok_reqs: list[ReqId] = []
+        doorbell_failures: list[ReqId] = []
+        for req_id in raw_ok_reqs:
+            if self._arrival_doorbell is None or worker_addr is None:
+                ok_reqs.append(req_id)
+                continue
+            slot_key = f"{req_id}@{worker_addr}"
+            if not self._arrival_doorbell.has_slot(slot_key):
+                ok_reqs.append(req_id)
+                continue
+            if self._arrival_doorbell.verify(slot_key):
+                ok_reqs.append(req_id)
+            else:
+                doorbell_failures.append(req_id)
 
         for req_id in ok_reqs:
             pull_meta = pull_metas[req_id]
@@ -1707,6 +1824,17 @@ class MooncakeConnectorWorker:
 
         if ok_reqs:
             logger.debug("pulling kv_caches for %s finished", ok_reqs)
+
+        if doorbell_failures:
+            logger.error(
+                "Arrival doorbell mismatch from %s for %s -- the producer "
+                "reported success but the rid-tagged nonce did not land "
+                "in the consumer's KV region. Marking as recv failure so "
+                "the scheduler can retry.",
+                worker_addr,
+                doorbell_failures,
+            )
+            self.xfer_stats.record_failed_recv()
 
         if response.err_reqs:
             logger.error(
