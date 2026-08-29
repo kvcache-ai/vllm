@@ -8,8 +8,10 @@ import copy
 import ctypes
 import socket
 import time
+from concurrent.futures import Future
 from contextlib import contextmanager
 from types import SimpleNamespace
+from typing import Any
 from unittest.mock import Mock, patch
 
 import pytest
@@ -28,6 +30,7 @@ from vllm.distributed.ec_transfer.ec_connector.mooncake_ec_connector import (
     ECMooncakeWorkerMetadata,
     _ConsumerPoolAllocation,
     _ContiguousAllocator,
+    _PendingPush,
 )
 from vllm.v1.core.sched.output import SchedulerOutput
 
@@ -504,7 +507,7 @@ class TestECMooncakeSchedulerMetadata:
             finally:
                 scheduler.shutdown()
 
-    def test_cancelled_transfer_ignores_late_ready_events(
+    def test_cancelled_transfer_ignores_late_ready_events_after_rpc_failure(
         self, mock_vllm_config_consumer
     ):
         """Cancelled is terminal even when a ready event was already queued."""
@@ -529,6 +532,11 @@ class TestECMooncakeSchedulerMetadata:
                 scheduler._cancelled_transfer_ids[transfer_id] = (
                     time.monotonic() + _LEASE_TTL_SECONDS
                 )
+                cancel: Future[bool] = Future()
+                cancel.set_exception(RuntimeError("consumer shard is unavailable"))
+                scheduler._pending_cancels[transfer_id] = cancel
+                scheduler._poll_pending_cancels()
+                assert transfer_id in scheduler._cancelled_transfer_ids
                 scheduler._event_zmq_socket = Mock()
                 scheduler._event_zmq_socket.recv_json.side_effect = [
                     {**event, "shard": port} for port in ports
@@ -541,6 +549,44 @@ class TestECMooncakeSchedulerMetadata:
                 assert scheduler._consumer_scheduler_metrics["events_cancelled"] == (
                     len(ports)
                 )
+            finally:
+                scheduler.shutdown()
+
+    def test_cancel_remote_attempts_all_shards_after_failure(
+        self, mock_vllm_config_consumer
+    ):
+        """A failed cancel RPC cannot keep later healthy shards pinned."""
+        shards = [f"shard-{index}" for index in range(4)]
+        error = RuntimeError("consumer shard is unavailable")
+        attempts = []
+
+        def cancel(addr: str, request: dict):
+            attempts.append(addr)
+            assert request == {
+                "op": "cancel",
+                "transfer_id": "transfer-0",
+                "reservation_id": "",
+            }
+            if addr == shards[1]:
+                raise error
+            return {"cancelled": True}
+
+        with patch_ec_mooncake_deps():
+            scheduler = ECMooncakeConnector(
+                mock_vllm_config_consumer, ECConnectorRole.SCHEDULER
+            )
+            scheduler._consumer_shard_cache[shards[0]] = shards
+            try:
+                with (
+                    patch.object(scheduler, "_send_control", side_effect=cancel),
+                    pytest.raises(
+                        RuntimeError, match="consumer shard is unavailable"
+                    ) as raised,
+                ):
+                    scheduler._cancel_remote(shards[0], "transfer-0", "")
+
+                assert raised.value is error
+                assert attempts == shards
             finally:
                 scheduler.shutdown()
 
@@ -1460,6 +1506,170 @@ class TestECMooncakeWorkerTransfer:
             finally:
                 producer.shutdown()
 
+    def test_partial_shard_reservation_waits_and_abandons_all(
+        self, mock_vllm_config_producer
+    ):
+        """A failed shard cannot strand successful or still-running reservations."""
+        shards = [f"shard-{index}" for index in range(4)]
+        spec = ECMooncakePushSpec(
+            mm_hash="hash",
+            nbytes=1,
+            shape=(1,),
+            dtype="uint8",
+            consumer_zmq=shards[0],
+            transfer_id="transfer-0",
+        )
+        events = []
+        shard_futures = [Mock() for _ in shards[1:]]
+        shard_futures[0].result.side_effect = RuntimeError(
+            "consumer buffer pool is full"
+        )
+        shard_executor = Mock()
+        shard_executor.submit.side_effect = shard_futures
+
+        def wait_for_all(futures):
+            assert list(futures) == shard_futures
+            events.append("waited")
+
+        def cancel(addr: str, request: dict):
+            events.append(f"cancel-{addr}")
+            assert request == {
+                "op": "cancel",
+                "transfer_id": spec.transfer_id,
+                "reservation_id": "",
+                "abandon": True,
+            }
+            return {"cancelled": True}
+
+        with patch_ec_mooncake_deps():
+            producer = ECMooncakeConnector(
+                mock_vllm_config_producer, ECConnectorRole.WORKER
+            )
+            producer._consumer_shard_cache[shards[0]] = shards
+            try:
+                with (
+                    patch.object(
+                        producer, "_shard_executor", return_value=shard_executor
+                    ),
+                    patch.object(
+                        producer,
+                        "_reserve_one",
+                        return_value={"addr": shards[0], "reservation_id": "r0"},
+                    ),
+                    patch(
+                        "vllm.distributed.ec_transfer.ec_connector."
+                        "mooncake_ec_connector.wait",
+                        side_effect=wait_for_all,
+                    ) as wait_all,
+                    patch.object(
+                        producer,
+                        "_send_control",
+                        side_effect=cancel,
+                    ),
+                    pytest.raises(RuntimeError, match="consumer buffer pool is full"),
+                ):
+                    producer._reserve_remote(spec)
+
+                assert wait_all.call_count == 2
+                assert events == ["waited", "waited"] + [
+                    f"cancel-{addr}" for addr in shards
+                ]
+            finally:
+                producer.shutdown()
+
+    def test_partial_shard_write_waits_before_releasing_buffers(
+        self, mock_vllm_config_producer
+    ):
+        """Source and destination buffers outlive every started shard write."""
+        source = torch.randn(4, 16)
+        spec = ECMooncakePushSpec(
+            mm_hash="hash",
+            nbytes=source.nbytes,
+            shape=tuple(source.shape),
+            dtype="float32",
+            consumer_zmq="shard-0",
+            transfer_id="transfer-0",
+        )
+        reservation: Future[list[dict[str, Any]]] = Future()
+        reservation.set_result(
+            [
+                {
+                    "addr": f"shard-{index}",
+                    "reservation_id": f"r{index}",
+                    "dst_session": f"session-{index}",
+                    "dst_ptr": index + 1,
+                    "nbytes": source.nbytes,
+                    "write": True,
+                    "ready": False,
+                }
+                for index in range(4)
+            ]
+        )
+        push = _PendingPush(source, spec, reservation, None, time.monotonic())
+        events = []
+        shard_futures = [Mock() for _ in range(3)]
+
+        def fail_write():
+            events.append("failed")
+            raise RuntimeError("shard write failed")
+
+        shard_futures[0].result.side_effect = fail_write
+        shard_executor = Mock()
+        shard_executor.submit.side_effect = shard_futures
+
+        def wait_for_all(futures):
+            assert list(futures) == shard_futures
+            events.append("waited")
+
+        with patch_ec_mooncake_deps():
+            producer = ECMooncakeConnector(
+                mock_vllm_config_producer, ECConnectorRole.WORKER
+            )
+            producer._queued_transfer_batches = 1
+            producer._active_push_sources[(spec.mm_hash, id(source))] = 1
+            try:
+                engine = Mock()
+                engine.batch_transfer_sync_write.return_value = 0
+
+                with (
+                    patch.object(producer, "_ensure_engine", return_value=engine),
+                    patch.object(
+                        producer, "_shard_executor", return_value=shard_executor
+                    ),
+                    patch(
+                        "vllm.distributed.ec_transfer.ec_connector."
+                        "mooncake_ec_connector.wait",
+                        side_effect=wait_for_all,
+                    ) as wait_all,
+                    patch.object(
+                        producer,
+                        "_stage_push_sources",
+                        return_value=([source], [(0, source.nbytes)]),
+                    ),
+                    patch.object(
+                        producer,
+                        "_release_push_staging",
+                        side_effect=lambda regions: events.append("released"),
+                    ),
+                    patch.object(
+                        producer,
+                        "_abandon_pushes",
+                        side_effect=lambda pushes: events.append("abandoned"),
+                    ) as abandon,
+                ):
+                    producer._push_batch([push])
+
+                wait_all.assert_called_once()
+                assert events == [
+                    "waited",
+                    "failed",
+                    "released",
+                    "abandoned",
+                ]
+                abandon.assert_called_once_with([push])
+            finally:
+                producer.shutdown()
+
     def test_pushes_stage_through_the_registered_pool(self, mock_vllm_config_producer):
         """Repeated content must not register overlapping source storage."""
         port = _find_free_port()
@@ -1477,6 +1687,9 @@ class TestECMooncakeWorkerTransfer:
             "consumer_buffer_pool_size": 4096,
         }
         mock_vllm_config_producer.ec_transfer_config.ec_buffer_device = "cpu"
+        mock_vllm_config_producer.ec_transfer_config.ec_connector_extra_config[
+            "producer_buffer_pool_size"
+        ] = 4096
         source = torch.randn(4, 16)
         pushes = [
             ECMooncakePushSpec(
@@ -1514,6 +1727,10 @@ class TestECMooncakeWorkerTransfer:
                     reservation.ready
                     for reservation in consumer._push_reservations.values()
                 )
+                address = pool.data_ptr()
+                producer.shutdown()
+                assert engine.unregister_calls == [address]
+                assert producer._producer_pool is None
             finally:
                 producer.shutdown()
                 consumer.shutdown()

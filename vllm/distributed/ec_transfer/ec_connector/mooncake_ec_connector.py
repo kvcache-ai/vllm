@@ -17,7 +17,7 @@ import time
 import uuid
 from collections import Counter, OrderedDict, deque
 from collections.abc import Callable, Collection
-from concurrent.futures import Future, ThreadPoolExecutor
+from concurrent.futures import Future, ThreadPoolExecutor, wait
 from contextlib import suppress
 from dataclasses import dataclass, field
 from typing import Any, Generic, TypeVar
@@ -1747,7 +1747,31 @@ class ECMooncakeConnector(ECConnectorBase):
             self._shard_executor().submit(self._reserve_one, addr, spec)
             for addr in shards[1:]
         ]
-        return [self._reserve_one(shards[0], spec)] + [f.result() for f in extra]
+        try:
+            first = self._reserve_one(shards[0], spec)
+            wait(extra)
+            return [first] + [future.result() for future in extra]
+        except Exception:
+            # A failed shard cannot make rollback race a reserve still in flight.
+            wait(extra)
+            for addr in shards:
+                try:
+                    self._send_control(
+                        addr,
+                        {
+                            "op": "cancel",
+                            "transfer_id": spec.transfer_id,
+                            "reservation_id": "",
+                            "abandon": True,
+                        },
+                    )
+                except Exception:
+                    logger.warning(
+                        "Failed to abandon partial EC reservation on %s",
+                        addr,
+                        exc_info=True,
+                    )
+            raise
 
     def _cancel_remote(
         self, consumer_zmq: str, transfer_id: str, reservation_id: str
@@ -1758,16 +1782,23 @@ class ECMooncakeConnector(ECConnectorBase):
         the first would leave the rest pinning pool slots until they expire.
         """
         cancelled = False
+        first_error: Exception | None = None
         for addr in self._consumer_shards(consumer_zmq):
-            result = self._send_control(
-                addr,
-                {
-                    "op": "cancel",
-                    "transfer_id": transfer_id,
-                    "reservation_id": reservation_id,
-                },
-            )
-            cancelled |= isinstance(result, dict) and bool(result.get("cancelled"))
+            try:
+                result = self._send_control(
+                    addr,
+                    {
+                        "op": "cancel",
+                        "transfer_id": transfer_id,
+                        "reservation_id": reservation_id,
+                    },
+                )
+                cancelled |= isinstance(result, dict) and bool(result.get("cancelled"))
+            except Exception as exc:
+                if first_error is None:
+                    first_error = exc
+        if first_error is not None:
+            raise first_error
         return cancelled
 
     def _poll_pending_cancels(self) -> None:
@@ -1779,7 +1810,8 @@ class ECMooncakeConnector(ECConnectorBase):
             try:
                 cancelled = future.result()
             except Exception:
-                self._cancelled_transfer_ids.pop(transfer_id, None)
+                # Cancellation is terminal. An RPC failure is ambiguous, so late
+                # readiness must not make the transfer visible again.
                 self._consumer_scheduler_metrics["cancellations_failed"] += 1
                 logger.warning(
                     "EC Mooncake reservation cancellation failed", exc_info=True
@@ -1978,8 +2010,9 @@ class ECMooncakeConnector(ECConnectorBase):
                     try:
                         write(*sessions[0])
                     finally:
-                        for future in extra:
-                            future.result()
+                        wait(extra)
+                    for future in extra:
+                        future.result()
                     stage_ms["rdma"] = (time.monotonic() - stage_started_at) * 1000
                 finally:
                     stage_started_at = time.monotonic()
@@ -2845,6 +2878,11 @@ class ECMooncakeConnector(ECConnectorBase):
                 self._consumer_residents.clear()
                 self._consumer_retire_events.clear()
                 self._consumer_pending_frees.clear()
+            if self._producer_pool is not None and self._unregister_memory(
+                self._producer_pool
+            ):
+                self._producer_pool = None
+                self._producer_pool_allocator = None
             # Published tensors and in-flight push sources share one refcounted
             # registration table, so a single pass covers both.
             with self._push_source_registration_lock:
