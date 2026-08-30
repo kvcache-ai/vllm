@@ -34,6 +34,7 @@ from vllm.distributed.ec_transfer.ec_connector.mooncake import (
     control,
     memory,
     metadata,
+    state,
     transfer,
 )
 from vllm.distributed.ec_transfer.ec_connector.mooncake.config import MooncakeECConfig
@@ -52,6 +53,11 @@ from vllm.distributed.ec_transfer.ec_connector.mooncake.memory import (
 )
 from vllm.distributed.ec_transfer.ec_connector.mooncake.scheduler import (
     ECMooncakeScheduler,
+)
+from vllm.distributed.ec_transfer.ec_connector.mooncake.state import (
+    InvalidSchedulerTransferTransition,
+    SchedulerTransferState,
+    SchedulerTransferTable,
 )
 from vllm.distributed.ec_transfer.ec_connector.mooncake.transfer import (
     MooncakeTransfer,
@@ -1551,6 +1557,181 @@ class TestECMooncakeWorkerMetadataAggregation:
         assert merged.reclaimed == {"c"}
 
 
+class TestSchedulerTransferTable:
+    @staticmethod
+    def pushed_spec(transfer_id: str, mm_hash: str = "hash") -> ECMooncakeLoadSpec:
+        return ECMooncakeLoadSpec(
+            mm_hash=mm_hash,
+            num_token=0,
+            nbytes=16,
+            shape=(4,),
+            dtype="float32",
+            pushed=True,
+            transfer_id=transfer_id,
+            reservation_id=f"reservation-{transfer_id}",
+        )
+
+    def test_legal_load_and_resident_reload_use_authoritative_record(self):
+        assert SchedulerTransferTable is state.SchedulerTransferTable
+        table = SchedulerTransferTable(resident_capacity=64, tombstone_ttl=30)
+        record, accepted = table.observe_ready(self.pushed_spec("transfer"), 10)
+
+        assert accepted and record.state is SchedulerTransferState.AVAILABLE
+        assert table.begin_load("hash", 7, "transfer", "request") is record
+        assert table.take_loads_to_dispatch() == [record]
+        assert record.spec is not None and record.spec.num_token == 7
+        assert table.complete_load("hash")
+        table.release_ready("hash", 1)
+        assert record.state is SchedulerTransferState.RESIDENT
+        assert table.begin_load("hash", 9) is record
+        assert record.spec is not None and record.spec.local
+
+    def test_illegal_transition_is_rejected(self):
+        table = SchedulerTransferTable(resident_capacity=64, tombstone_ttl=30)
+        record, _ = table.observe_ready(self.pushed_spec("transfer"), 10)
+
+        with pytest.raises(InvalidSchedulerTransferTransition):
+            table.mark_unavailable("transfer", "late", 1)
+        assert record.state is SchedulerTransferState.AVAILABLE
+
+    def test_same_hash_index_preserves_transfer_order_and_identity(self):
+        table = SchedulerTransferTable(resident_capacity=64, tombstone_ttl=30)
+        first, _ = table.observe_ready(self.pushed_spec("first"), 10)
+        second, _ = table.observe_ready(self.pushed_spec("second"), 10)
+
+        assert table.records_for_hash("hash", tuple(SchedulerTransferState)) == [
+            first,
+            second,
+        ]
+        assert table.begin_load("hash", 3) is first
+        assert (
+            table.first_for_hash("hash", (SchedulerTransferState.AVAILABLE,)) is second
+        )
+        with pytest.raises(ValueError):
+            table.observe_ready(self.pushed_spec("first", "other-hash"), 10)
+
+    def test_unavailable_notification_drains_once_and_rejects_late_ready(self):
+        table = SchedulerTransferTable(resident_capacity=64, tombstone_ttl=30)
+        record = table.wait_for_event("transfer", "request-r", "hash", 1)
+        table.mark_unavailable("transfer", "timed out", 2)
+
+        assert table.take_unavailable_requests() == {"request-r"}
+        assert table.take_unavailable_requests() == set()
+        table.wait_for_event("transfer", "request-r", "hash", 3)
+        assert table.take_unavailable_requests() == set()
+        table.wait_for_event("transfer", "request-n", "hash", 3)
+        assert table.take_unavailable_requests() == {"request-n"}
+        assert table.take_unavailable_requests() == set()
+        table.wait_for_event("transfer", "request-n", "hash", 3)
+        assert table.take_unavailable_requests() == set()
+        same, accepted = table.observe_ready(self.pushed_spec("transfer"), 40)
+        assert same is record and not accepted
+        assert record.state is SchedulerTransferState.UNAVAILABLE
+
+    def test_cancel_and_duplicate_completion_are_idempotent(self):
+        table = SchedulerTransferTable(resident_capacity=64, tombstone_ttl=30)
+        cancelled = table.wait_for_event("cancelled", "request", "hash", 10)
+        assert table.cancel("cancelled", 1)
+        assert not table.cancel("cancelled", 2)
+        _, accepted = table.observe_ready(self.pushed_spec("cancelled"), 40)
+        assert not accepted and cancelled.state is SchedulerTransferState.CANCELLED
+
+        record, _ = table.observe_ready(self.pushed_spec("completed", "other"), 10)
+        table.begin_load("other", 4, "completed")
+        assert table.complete_load("other")
+        assert table.complete_load("other")
+        assert record.state is SchedulerTransferState.READY
+
+    def test_failed_record_expires_from_record_and_hash_index(self):
+        table = SchedulerTransferTable(resident_capacity=64, tombstone_ttl=30)
+        record, _ = table.observe_ready(self.pushed_spec("failed"), 10)
+        table.begin_load("hash", 4, "failed")
+
+        assert table.fail_load("hash", "copy failed", 20)
+        assert record.deadline == 50
+        _, dropped = table.expire(51, terminal_limit=100)
+        assert dropped == 1
+        assert table.get("failed") is None
+        assert table.records_for_hash("hash", tuple(SchedulerTransferState)) == []
+
+    def test_reclaimed_resident_tombstone_expires(self):
+        table = SchedulerTransferTable(resident_capacity=64, tombstone_ttl=30)
+        record, _ = table.observe_ready(self.pushed_spec("reclaimed"), 10)
+        table.begin_load("hash", 4, "reclaimed")
+        table.complete_load("hash")
+        table.release_ready("hash", 20)
+
+        table.reclaim("hash", 30)
+        assert record.state is SchedulerTransferState.EXPIRED
+        assert record.deadline == 60
+        table.expire(61, terminal_limit=100)
+        assert table.get("reclaimed") is None
+        assert table.records_for_hash("hash", tuple(SchedulerTransferState)) == []
+
+    def test_capacity_eviction_tombstone_expires(self):
+        table = SchedulerTransferTable(resident_capacity=0, tombstone_ttl=30)
+        record, _ = table.observe_ready(self.pushed_spec("evicted"), 10)
+        table.begin_load("hash", 4, "evicted")
+        table.complete_load("hash")
+
+        table.release_ready("hash", 20)
+        assert record.state is SchedulerTransferState.EXPIRED
+        assert record.deadline == 50
+        table.expire(51, terminal_limit=100)
+        assert table.get("evicted") is None
+        assert table.records_for_hash("hash", tuple(SchedulerTransferState)) == []
+
+    def test_terminal_record_limit_prunes_oldest_records(self):
+        table = SchedulerTransferTable(resident_capacity=64, tombstone_ttl=30)
+        for transfer_id in ("first", "second", "third"):
+            table.cancel(transfer_id, 1)
+
+        _, dropped = table.expire(2, terminal_limit=1)
+        assert dropped == 2
+        assert table.get("first") is None
+        assert table.get("second") is None
+        assert table.get("third") is not None
+
+    def test_zero_terminal_limit_prunes_every_record(self):
+        table = SchedulerTransferTable(resident_capacity=64, tombstone_ttl=30)
+        table.cancel("first", 1)
+        table.cancel("second", 1)
+
+        _, dropped = table.expire(2, terminal_limit=0)
+        assert dropped == 2
+        assert table.get("first") is None
+        assert table.get("second") is None
+
+    def test_negative_terminal_limit_is_rejected_without_mutation(self):
+        table = SchedulerTransferTable(resident_capacity=64, tombstone_ttl=30)
+        record = table.wait_for_event("transfer", "request", "hash", 1)
+
+        with pytest.raises(ValueError, match="terminal_limit"):
+            table.expire(2, terminal_limit=-1)
+        assert table.get("transfer") is record
+        assert record.state is SchedulerTransferState.WAITING_EVENT
+
+    def test_same_hash_residency_uses_only_the_latest_completed_record(self):
+        table = SchedulerTransferTable(resident_capacity=32, tombstone_ttl=30)
+        first, _ = table.observe_ready(self.pushed_spec("first"), 10)
+        table.begin_load("hash", 4, "first")
+        table.complete_load("hash")
+        table.release_ready("hash", 20)
+        second, _ = table.observe_ready(self.pushed_spec("second"), 30)
+        table.begin_load("hash", 4, "second")
+        table.complete_load("hash")
+        table.release_ready("hash", 40)
+        third, _ = table.observe_ready(self.pushed_spec("third", "other"), 50)
+        table.begin_load("other", 4, "third")
+        table.complete_load("other")
+        table.release_ready("other", 60)
+
+        assert first.state is SchedulerTransferState.EXPIRED
+        assert second.state is SchedulerTransferState.RESIDENT
+        assert third.state is SchedulerTransferState.RESIDENT
+        assert table.resident_bytes == 32
+
+
 class TestECMooncakeSchedulerMetadata:
     def test_missing_push_event_is_tracked(
         self, mock_vllm_config_consumer, mock_request_with_3_mm
@@ -1569,12 +1750,13 @@ class TestECMooncakeSchedulerMetadata:
             try:
                 with patch.object(scheduler._scheduler, "_drain_push_notifications"):
                     assert not scheduler.ensure_cache_available(request, 0)
-                mm_hash = request.mm_features[0].identifier
                 assert (
                     scheduler._scheduler._consumer_scheduler_metrics["missing_event"]
                     == 1
                 )
-                assert mm_hash in scheduler._scheduler._consumer_missing_since
+                record = scheduler._scheduler._transfers.get(f"{request.request_id}:0")
+                assert record is not None
+                assert record.state is SchedulerTransferState.WAITING_EVENT
             finally:
                 scheduler.shutdown()
 
@@ -1589,8 +1771,6 @@ class TestECMooncakeSchedulerMetadata:
         }
         request = mock_request_with_3_mm
         request.mm_features = request.mm_features[:1]
-        mm_hash = request.mm_features[0].identifier
-
         with patch_ec_mooncake_deps():
             scheduler = ECMooncakeConnector(
                 mock_vllm_config_consumer, ECConnectorRole.SCHEDULER
@@ -1609,7 +1789,11 @@ class TestECMooncakeSchedulerMetadata:
                     assert (
                         scheduler._scheduler._consumer_scheduler_metrics["stalled"] == 1
                     )
-                    assert mm_hash in scheduler._scheduler._stalled_hashes
+                    record = scheduler._scheduler._transfers.get(
+                        f"{request.request_id}:0"
+                    )
+                    assert record is not None
+                    assert record.state is SchedulerTransferState.UNAVAILABLE
                     # The stall is reported once, not once per scheduling pass.
                     assert not scheduler.ensure_cache_available(request, 0)
                 assert scheduler._scheduler._consumer_scheduler_metrics["stalled"] == 1
@@ -1636,11 +1820,38 @@ class TestECMooncakeSchedulerMetadata:
             )
             try:
                 for spec in specs:
-                    scheduler._scheduler._index_pending_spec(spec)
-                scheduler._scheduler._pop_pending_spec("transfer-0")
-                assert "hash" in scheduler._scheduler._consumer_pending_since
-                scheduler._scheduler._pop_pending_spec("transfer-1")
-                assert "hash" not in scheduler._scheduler._consumer_pending_since
+                    scheduler._scheduler._transfers.observe_ready(spec, 10)
+                scheduler._scheduler._transfers.cancel("transfer-0", 0)
+                available = scheduler._scheduler._transfers.records_for_hash(
+                    "hash", (SchedulerTransferState.AVAILABLE,)
+                )
+                assert [record.transfer_id for record in available] == ["transfer-1"]
+                scheduler._scheduler._transfers.cancel("transfer-1", 0)
+                assert (
+                    scheduler._scheduler._transfers.first_for_hash(
+                        "hash", (SchedulerTransferState.AVAILABLE,)
+                    )
+                    is None
+                )
+            finally:
+                scheduler.shutdown()
+
+    def test_available_expiry_is_cancelled_before_tombstone_cleanup(
+        self, mock_vllm_config_consumer
+    ):
+        with patch_ec_mooncake_deps():
+            scheduler = ECMooncakeConnector(
+                mock_vllm_config_consumer, ECConnectorRole.SCHEDULER
+            )
+            record, _ = scheduler._scheduler._transfers.observe_ready(
+                TestSchedulerTransferTable.pushed_spec("expired"), 0
+            )
+            try:
+                with patch.object(scheduler._scheduler, "_queue_cancel") as cancel:
+                    scheduler._scheduler._expire_transfers()
+                cancel.assert_called_once_with("expired")
+                assert record.state is SchedulerTransferState.EXPIRED
+                assert scheduler._scheduler._transfers.get("expired") is record
             finally:
                 scheduler.shutdown()
 
@@ -1665,7 +1876,7 @@ class TestECMooncakeSchedulerMetadata:
                         {"mm_hash": mm_hash, "transfer_id": "request-transfer"}
                     ]
                 }
-                scheduler._scheduler._index_pending_spec(
+                scheduler._scheduler._transfers.observe_ready(
                     ECMooncakeLoadSpec(
                         mm_hash=mm_hash,
                         num_token=0,
@@ -1675,7 +1886,8 @@ class TestECMooncakeSchedulerMetadata:
                         pushed=True,
                         transfer_id="request-transfer",
                         reservation_id="reservation",
-                    )
+                    ),
+                    10,
                 )
                 with (
                     patch.object(scheduler._scheduler, "_drain_push_notifications"),
@@ -1683,11 +1895,18 @@ class TestECMooncakeSchedulerMetadata:
                 ):
                     assert scheduler.ensure_cache_available(request, 0, {mm_hash})
                     cancel.assert_not_called()
-                    assert "request-transfer" in scheduler._scheduler._pending_specs
+                    record = scheduler._scheduler._transfers.get("request-transfer")
+                    assert record is not None
+                    assert record.state is SchedulerTransferState.AVAILABLE
 
                     # Once the entry is evicted the request can still get it.
                     assert not scheduler.ensure_cache_available(request, 0, set())
-                assert mm_hash in scheduler._scheduler._loading_hashes
+                assert (
+                    scheduler._scheduler._transfers.first_for_hash(
+                        mm_hash, (SchedulerTransferState.LOADING,)
+                    )
+                    is not None
+                )
             finally:
                 scheduler.shutdown()
 
@@ -1711,7 +1930,7 @@ class TestECMooncakeSchedulerMetadata:
                 mock_vllm_config_consumer, ECConnectorRole.SCHEDULER
             )
             try:
-                scheduler._scheduler._index_pending_spec(
+                scheduler._scheduler._transfers.observe_ready(
                     ECMooncakeLoadSpec(
                         mm_hash=mm_hash,
                         num_token=0,
@@ -1721,14 +1940,13 @@ class TestECMooncakeSchedulerMetadata:
                         pushed=True,
                         transfer_id="consumed-transfer",
                         reservation_id="reservation",
-                    )
+                    ),
+                    10,
                 )
-                with patch.object(scheduler._scheduler, "_queue_cancel") as cancel:
-                    scheduler.update_state_after_free(request, 0)
-                # Cancelled by transfer: a shard's reservation id means
-                # nothing to its peers, so it is not passed along.
-                cancel.assert_called_once_with("consumed-transfer")
-                assert "consumed-transfer" not in scheduler._scheduler._pending_specs
+                scheduler.update_state_after_free(request, 0)
+                record = scheduler._scheduler._transfers.get("consumed-transfer")
+                assert record is not None
+                assert record.state is SchedulerTransferState.CANCELLED
             finally:
                 scheduler.shutdown()
 
@@ -1766,23 +1984,47 @@ class TestECMooncakeSchedulerMetadata:
                 mock_vllm_config_consumer, ECConnectorRole.SCHEDULER
             )
             try:
-                scheduler._scheduler._ready_hashes.add(mm_hash)
+                current = ECMooncakeLoadSpec(
+                    mm_hash=mm_hash,
+                    num_token=0,
+                    nbytes=16,
+                    shape=(4,),
+                    dtype="float32",
+                    pushed=True,
+                    transfer_id="current-transfer",
+                    reservation_id="current",
+                )
+                scheduler._scheduler._transfers.observe_ready(
+                    current, time.monotonic() + _LEASE_TTL_SECONDS
+                )
+                scheduler._scheduler._transfers.begin_load(
+                    mm_hash, 4, "current-transfer"
+                )
+                scheduler._scheduler._transfers.take_loads_to_dispatch()
+                scheduler._scheduler._transfers.complete_load(mm_hash)
                 scheduler._scheduler._event_inbox.drain = Mock(return_value=[event])
                 with patch.object(scheduler._scheduler, "_queue_cancel") as cancel:
                     scheduler._scheduler._drain_push_notifications()
                 cancel.assert_not_called()
-                assert "later-transfer" in scheduler._scheduler._pending_specs
+                later = scheduler._scheduler._transfers.get("later-transfer")
+                assert later is not None
+                assert later.state is SchedulerTransferState.AVAILABLE
 
                 # The scheduler frees the encoder cache entry.
                 scheduler.build_connector_meta(
                     SimpleNamespace(free_encoder_mm_hashes=[mm_hash])
                 )
-                assert mm_hash not in scheduler._scheduler._ready_hashes
+                assert (
+                    scheduler._scheduler._transfers.first_for_hash(
+                        mm_hash, (SchedulerTransferState.READY,)
+                    )
+                    is None
+                )
 
                 # The request that owns the transfer can still pick it up.
                 with patch.object(scheduler._scheduler, "_drain_push_notifications"):
                     assert not scheduler.ensure_cache_available(request, 0, set())
-                assert mm_hash in scheduler._scheduler._loading_hashes
+                assert later.state is SchedulerTransferState.LOADING
             finally:
                 scheduler.shutdown()
 
@@ -1808,8 +2050,8 @@ class TestECMooncakeSchedulerMetadata:
             )
             try:
                 scheduler._scheduler._event_inbox.shard_count = len(ports)
-                scheduler._scheduler._cancelled_transfer_ids[transfer_id] = (
-                    time.monotonic() + _LEASE_TTL_SECONDS
+                scheduler._scheduler._transfers.cancel(
+                    transfer_id, time.monotonic(), mm_hash="hash"
                 )
                 scheduler._scheduler._event_inbox.drain = Mock(
                     return_value=[{**event, "shard": port} for port in ports]
@@ -1817,11 +2059,36 @@ class TestECMooncakeSchedulerMetadata:
 
                 scheduler._scheduler._drain_push_notifications()
 
-                assert transfer_id not in scheduler._scheduler._pending_specs
+                record = scheduler._scheduler._transfers.get(transfer_id)
+                assert record is not None
+                assert record.state is SchedulerTransferState.CANCELLED
                 assert transfer_id not in scheduler._scheduler._event_ready_shards
                 assert scheduler._scheduler._consumer_scheduler_metrics[
                     "events_cancelled"
                 ] == len(ports)
+            finally:
+                scheduler.shutdown()
+
+    def test_cancel_rpc_failure_keeps_tombstone_and_rejects_late_ready(
+        self, mock_vllm_config_consumer
+    ):
+        with patch_ec_mooncake_deps():
+            scheduler = ECMooncakeConnector(
+                mock_vllm_config_consumer, ECConnectorRole.SCHEDULER
+            )
+            spec = TestSchedulerTransferTable.pushed_spec("transfer")
+            record, _ = scheduler._scheduler._transfers.observe_ready(spec, 10)
+            scheduler._scheduler._transfers.cancel("transfer", 1)
+            failed = Mock()
+            failed.done.return_value = True
+            failed.result.side_effect = RuntimeError("unknown remote result")
+            scheduler._scheduler._pending_cancels["transfer"] = failed
+            try:
+                scheduler._scheduler._poll_pending_cancels()
+                assert record.state is SchedulerTransferState.CANCELLED
+                assert record.spec is spec
+                same, accepted = scheduler._scheduler._transfers.observe_ready(spec, 20)
+                assert same is record and not accepted
             finally:
                 scheduler.shutdown()
 
@@ -1875,12 +2142,14 @@ class TestECMooncakeSchedulerMetadata:
                     scheduler._scheduler, "_cancel_remote", return_value=True
                 ):
                     scheduler.update_state_after_free(request, 0)
-                assert transfer_id in scheduler._scheduler._cancelled_transfer_ids
+                record = scheduler._scheduler._transfers.get(transfer_id)
+                assert record is not None
+                assert record.state is SchedulerTransferState.CANCELLED
                 assert transfer_id not in scheduler._scheduler._event_ready_shards
 
                 deliver(scheduler, 2, 3)
 
-                assert transfer_id not in scheduler._scheduler._pending_specs
+                assert record.state is SchedulerTransferState.CANCELLED
                 assert transfer_id not in scheduler._scheduler._event_ready_shards
                 assert (
                     scheduler._scheduler._consumer_scheduler_metrics["events_cancelled"]
@@ -1910,30 +2179,32 @@ class TestECMooncakeSchedulerMetadata:
                         scheduler._scheduler._queue_cancel(name)
 
                 now = time.monotonic()
-                assert scheduler._scheduler._cancelled_transfer_ids["third"] > now
-                assert scheduler._scheduler._cancelled_transfer_ids["third"] <= (
-                    now + _LEASE_TTL_SECONDS
-                )
+                third = scheduler._scheduler._transfers.get("third")
+                assert third is not None and third.deadline is not None
+                assert third.deadline > now
+                assert third.deadline <= now + _LEASE_TTL_SECONDS
 
                 # Ignored for exactly as long as the worker refuses to reserve
                 # the id again, and no longer. The drain is what sweeps.
-                scheduler._scheduler._cancelled_transfer_ids["first"] = 0.0
+                first = scheduler._scheduler._transfers.get("first")
+                assert first is not None
+                first.deadline = 0.0
                 scheduler._scheduler._drain_pending = True
                 scheduler._scheduler._drain_push_notifications()
-                assert list(scheduler._scheduler._cancelled_transfer_ids) == [
-                    "second",
-                    "third",
-                ]
+                assert scheduler._scheduler._transfers.get("first") is None
+                assert scheduler._scheduler._transfers.get("second") is not None
+                assert scheduler._scheduler._transfers.get("third") is third
 
                 # The count is the backstop for a rate that outruns the TTL.
                 with patch(
                     "vllm.distributed.ec_transfer.ec_connector."
-                    "mooncake.scheduler._MAX_CANCELLED_TRANSFER_IDS",
+                    "mooncake.scheduler._MAX_TERMINAL_TRANSFER_RECORDS",
                     1,
                 ):
                     scheduler._scheduler._drain_pending = True
                     scheduler._scheduler._drain_push_notifications()
-                assert list(scheduler._scheduler._cancelled_transfer_ids) == ["third"]
+                assert scheduler._scheduler._transfers.get("second") is None
+                assert scheduler._scheduler._transfers.get("third") is third
                 assert (
                     scheduler._scheduler._consumer_scheduler_metrics[
                         "cancel_records_dropped"
@@ -1959,8 +2230,6 @@ class TestECMooncakeSchedulerMetadata:
         }
         request = mock_request_with_3_mm
         request.mm_features = request.mm_features[:1]
-        mm_hash = request.mm_features[0].identifier
-
         with patch_ec_mooncake_deps():
             scheduler = ECMooncakeConnector(
                 mock_vllm_config_consumer, ECConnectorRole.SCHEDULER
@@ -1984,9 +2253,9 @@ class TestECMooncakeSchedulerMetadata:
                 assert scheduler.take_unavailable_requests() == {request.request_id}
                 # Draining clears it: the scheduler acts on each id once.
                 assert scheduler.take_unavailable_requests() == set()
-                # A re-issued request gets a fresh window rather than the
-                # expired one, or it would fail before its push could land.
-                assert mm_hash not in scheduler._scheduler._consumer_missing_since
+                record = scheduler._scheduler._transfers.get(f"{request.request_id}:0")
+                assert record is not None
+                assert record.state is SchedulerTransferState.UNAVAILABLE
             finally:
                 scheduler.shutdown()
 
@@ -2108,7 +2377,9 @@ class TestECMooncakeSchedulerMetadata:
                         )
                     )
                 )
-                assert not scheduler._scheduler._pending_specs
+                record = scheduler._scheduler._transfers.get("only-transfer")
+                assert record is not None
+                assert record.state is SchedulerTransferState.READY
 
                 # The encoder cache evicts the entry.
                 scheduler.build_connector_meta(
@@ -2120,7 +2391,7 @@ class TestECMooncakeSchedulerMetadata:
                 with patch.object(scheduler._scheduler, "_drain_push_notifications"):
                     assert scheduler.has_cache_item(mm_hash)
                     assert not scheduler.ensure_cache_available(second, 0, set())
-                assert mm_hash in scheduler._scheduler._loading_hashes
+                assert record.state is SchedulerTransferState.LOADING
                 reload = scheduler.build_connector_meta(
                     SimpleNamespace(free_encoder_mm_hashes=[])
                 )
@@ -2146,15 +2417,20 @@ class TestECMooncakeSchedulerMetadata:
                 mock_vllm_config_consumer, ECConnectorRole.SCHEDULER
             )
             try:
-                scheduler._scheduler._note_resident(
-                    ECMooncakeLoadSpec(
-                        mm_hash=mm_hash,
-                        num_token=0,
-                        nbytes=16,
-                        shape=(4,),
-                        dtype="float32",
-                    )
+                spec = ECMooncakeLoadSpec(
+                    mm_hash=mm_hash,
+                    num_token=0,
+                    nbytes=16,
+                    shape=(4,),
+                    dtype="float32",
+                    transfer_id="transfer",
                 )
+                table = scheduler._scheduler._transfers
+                table.observe_ready(spec, time.monotonic() + _LEASE_TTL_SECONDS)
+                table.begin_load(mm_hash, 4, "transfer")
+                table.take_loads_to_dispatch()
+                table.complete_load(mm_hash)
+                table.release_ready(mm_hash, time.monotonic())
                 with patch.object(scheduler._scheduler, "_drain_push_notifications"):
                     assert scheduler.has_cache_item(mm_hash)
 
@@ -2167,7 +2443,46 @@ class TestECMooncakeSchedulerMetadata:
                 )
                 with patch.object(scheduler._scheduler, "_drain_push_notifications"):
                     assert not scheduler.has_cache_item(mm_hash)
-                assert scheduler._scheduler._resident_bytes == 0
+                assert table.resident_bytes == 0
+            finally:
+                scheduler.shutdown()
+
+    def test_reclaim_keeps_ready_cache_visible_until_it_is_freed(
+        self, mock_vllm_config_consumer
+    ):
+        with patch_ec_mooncake_deps():
+            scheduler = ECMooncakeConnector(
+                mock_vllm_config_consumer, ECConnectorRole.SCHEDULER
+            )
+            table = scheduler._scheduler._transfers
+            spec = ECMooncakeLoadSpec(
+                mm_hash="hash",
+                num_token=0,
+                nbytes=16,
+                shape=(4,),
+                dtype="float32",
+                transfer_id="transfer",
+            )
+            try:
+                table.observe_ready(spec, time.monotonic() + _LEASE_TTL_SECONDS)
+                table.begin_load("hash", 4, "transfer")
+                table.take_loads_to_dispatch()
+                table.complete_load("hash")
+
+                scheduler.update_connector_output(
+                    SimpleNamespace(
+                        ec_connector_worker_meta=ECMooncakeWorkerMetadata(
+                            reclaimed={"hash"}
+                        )
+                    )
+                )
+                with patch.object(scheduler._scheduler, "_drain_push_notifications"):
+                    assert scheduler.has_cache_item("hash")
+                scheduler.build_connector_meta(
+                    SimpleNamespace(free_encoder_mm_hashes=["hash"])
+                )
+                with patch.object(scheduler._scheduler, "_drain_push_notifications"):
+                    assert not scheduler.has_cache_item("hash")
             finally:
                 scheduler.shutdown()
 
@@ -2193,14 +2508,23 @@ class TestECMooncakeSchedulerMetadata:
                 mock_vllm_config_consumer, ECConnectorRole.SCHEDULER
             )
             scheduler._scheduler._event_inbox.drain = Mock(return_value=[event])
-            scheduler._scheduler._loading_hashes.add("hash")
+            current = ECMooncakeLoadSpec(
+                mm_hash="hash",
+                num_token=0,
+                nbytes=64,
+                shape=(2, 8),
+                dtype="float32",
+                transfer_id="current-transfer",
+            )
+            scheduler._scheduler._transfers.observe_ready(current, time.monotonic() + 1)
+            scheduler._scheduler._transfers.begin_load("hash", 2, "current-transfer")
 
             scheduler._scheduler._drain_push_notifications()
 
-            assert (
-                scheduler._scheduler._pending_specs["next-transfer"].reservation_id
-                == "next"
-            )
+            pending = scheduler._scheduler._transfers.get("next-transfer")
+            assert pending is not None and pending.spec is not None
+            assert pending.state is SchedulerTransferState.AVAILABLE
+            assert pending.spec.reservation_id == "next"
 
     def test_build_connector_meta_clears_pending(
         self, mock_vllm_config_consumer, mock_request_with_3_mm
@@ -2218,9 +2542,10 @@ class TestECMooncakeSchedulerMetadata:
                 dtype="float32",
                 transfer_id="transfer",
             )
-            scheduler._scheduler._index_pending_spec(load_spec)
-            scheduler._scheduler._load_specs[mm_hash] = load_spec
-            scheduler._scheduler._mm_datas_need_loads[mm_hash] = 100
+            scheduler._scheduler._transfers.observe_ready(
+                load_spec, time.monotonic() + _LEASE_TTL_SECONDS
+            )
+            scheduler._scheduler._transfers.begin_load(mm_hash, 100, "transfer")
             meta = scheduler.build_connector_meta(
                 Mock(spec=SchedulerOutput, free_encoder_mm_hashes=[])
             )
@@ -2228,8 +2553,10 @@ class TestECMooncakeSchedulerMetadata:
             assert len(meta.loads) == 1
             assert meta.loads[0].mm_hash == mm_hash
             assert meta.loads[0].num_token == 100
-            assert scheduler._scheduler._mm_datas_need_loads == {}
-            assert "transfer" not in scheduler._scheduler._pending_specs
+            assert scheduler._scheduler._transfers.take_loads_to_dispatch() == []
+            record = scheduler._scheduler._transfers.get("transfer")
+            assert record is not None
+            assert record.state is SchedulerTransferState.LOADING
 
     def test_producer_does_not_build_load_metadata(
         self, mock_vllm_config_producer, mock_request_with_3_mm
@@ -2615,7 +2942,9 @@ class TestECMooncakeWorkerTransfer:
                     # Still just the two setup requests: polling for readiness
                     # must not re-open the channel.
                     assert send_control.call_count == 2
-                load = scheduler._scheduler._pending_specs["transfer-1"]
+                record = scheduler._scheduler._transfers.get("transfer-1")
+                assert record is not None and record.spec is not None
+                load = record.spec
                 consumer.bind_connector_metadata(
                     ECMooncakeConnectorMetadata(loads=[load])
                 )
@@ -2743,8 +3072,9 @@ class TestECMooncakeWorkerTransfer:
                 while not scheduler.has_cache_item("hash"):
                     assert time.monotonic() < deadline
                     time.sleep(0.01)
-                load = scheduler._scheduler._pop_pending_spec("transfer-1")
-                assert load is not None
+                record = scheduler._scheduler._transfers.get("transfer-1")
+                assert record is not None and record.spec is not None
+                load = record.spec
                 load.num_token = 4
                 consumer.bind_connector_metadata(
                     ECMooncakeConnectorMetadata(loads=[load])
@@ -2777,8 +3107,9 @@ class TestECMooncakeWorkerTransfer:
                 while not scheduler.has_cache_item("hash"):
                     assert time.monotonic() < deadline
                     time.sleep(0.01)
-                cached_load = scheduler._scheduler._pop_pending_spec("transfer-2")
-                assert cached_load is not None
+                record = scheduler._scheduler._transfers.get("transfer-2")
+                assert record is not None and record.spec is not None
+                cached_load = record.spec
                 cached_load.num_token = 4
                 consumer.bind_connector_metadata(
                     ECMooncakeConnectorMetadata(loads=[cached_load])
