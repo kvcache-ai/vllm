@@ -10,17 +10,15 @@ Mooncake transport instead of shared filesystem.
 
 from __future__ import annotations
 
-import bisect
 import math
 import threading
 import time
 import uuid
 from collections import Counter, OrderedDict, deque
-from collections.abc import Callable
 from concurrent.futures import Future, ThreadPoolExecutor
 from contextlib import suppress
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any, Generic, TypeVar
+from typing import TYPE_CHECKING, Any
 
 import torch
 
@@ -34,6 +32,12 @@ from vllm.distributed.ec_transfer.ec_connector.mooncake.control import (
     ControlClient,
     ControlCompletion,
     ShardTopology,
+)
+from vllm.distributed.ec_transfer.ec_connector.mooncake.memory import (
+    ConsumerMemoryPool,
+    MemoryAllocation,
+    ProducerMemoryPool,
+    ResidentLease,
 )
 from vllm.distributed.ec_transfer.ec_connector.mooncake.metadata import (
     ECMooncakeConnectorMetadata,
@@ -52,8 +56,6 @@ logger = init_logger(__name__)
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
 
-_T = TypeVar("_T")
-
 _LEASE_TTL_SECONDS = 300
 _RESERVATION_REFRESH_SECONDS = _LEASE_TTL_SECONDS / 2
 # A cancelled transfer stays on the scheduler's ignore list for as long as the
@@ -63,21 +65,15 @@ _MAX_CANCELLED_TRANSFER_IDS = 1 << 16
 
 
 @dataclass
-class _ConsumerPoolAllocation:
-    offset: int
-    size: int
-    tensor: torch.Tensor
-
-
-@dataclass
 class _PushReservation:
     mm_hash: str
     reservation_id: str
-    allocation: _ConsumerPoolAllocation
+    allocation: MemoryAllocation
     shape: tuple[int, ...]
     dtype: str
     ready: bool = False
     owns_allocation: bool = True
+    resident_lease: ResidentLease[MemoryAllocation] | None = None
     discard_on_complete: bool = False
     created_at: float = field(default_factory=time.monotonic)
     expires_at: float = 0
@@ -102,167 +98,6 @@ class _PushPerfWindow:
     failures: int = 0
     stage_totals_ms: dict[str, float] = field(default_factory=dict)
     stage_max_ms: dict[str, float] = field(default_factory=dict)
-
-
-class _ResidentPool(Generic[_T]):
-    """Content-addressed entries kept until their space is needed.
-
-    Both sides of the connector hold the same thing under different names: a
-    map from mm_hash to a device resource, a count of who is using it, and an
-    eviction order over the rest. This is `BlockPool`'s accounting for
-    variable-sized entries: `acquire`/`release` mirror `touch`/`free_blocks`,
-    and `evict_lru` mirrors the reclaim inside `get_new_blocks`.
-
-    An unreferenced entry stays resident. Eviction is driven by pressure, so
-    the entry serves whoever needs it next instead of being transferred again.
-    """
-
-    def __init__(self, capacity: int):
-        self.capacity = capacity
-        self.used = 0
-        self._entries: dict[str, tuple[_T, int]] = {}
-        self._refs: Counter[str] = Counter()
-        # Unreferenced entries in eviction order, oldest first.
-        self._evictable: OrderedDict[str, None] = OrderedDict()
-
-    def __len__(self) -> int:
-        return len(self._entries)
-
-    def __contains__(self, key: str) -> bool:
-        return key in self._entries
-
-    @property
-    def num_evictable(self) -> int:
-        return len(self._evictable)
-
-    def referenced(self) -> list[str]:
-        """Keys that are in use. `_refs` only holds entries above zero."""
-        return list(self._refs)
-
-    def referenced_or_retired(self) -> list[str]:
-        """Every key held, in insertion order."""
-        return list(self._entries)
-
-    def get(self, key: str) -> _T | None:
-        entry = self._entries.get(key)
-        return entry[0] if entry is not None else None
-
-    def insert(self, key: str, value: _T, nbytes: int) -> None:
-        """Add a referenced entry, replacing any previous one."""
-        previous = self._entries.get(key)
-        if previous is not None:
-            self.used -= previous[1]
-        self._entries[key] = (value, nbytes)
-        self.used += nbytes
-        self.pin(key)
-
-    def pin(self, key: str) -> _T | None:
-        """Mark an entry as in use without counting a new reference.
-
-        For a holder whose references are discovered by scanning rather than
-        released in pairs, `pin`/`retire` are the matching operations.
-        """
-        entry = self._entries.get(key)
-        if entry is None:
-            return None
-        self._evictable.pop(key, None)
-        self._refs[key] = max(1, self._refs[key])
-        return entry[0]
-
-    def retire(self, key: str) -> None:
-        """Drop every reference; the entry is evictable from now on."""
-        if key not in self._entries:
-            return
-        self._refs.pop(key, None)
-        self._evictable[key] = None
-
-    def refresh(self, key: str) -> None:
-        """Move an unreferenced entry to the back of the eviction order."""
-        if key in self._evictable:
-            self._evictable.move_to_end(key)
-
-    def acquire(self, key: str) -> _T | None:
-        """Take one reference so pressure cannot evict the entry."""
-        entry = self._entries.get(key)
-        if entry is None:
-            return None
-        self._evictable.pop(key, None)
-        self._refs[key] += 1
-        return entry[0]
-
-    def release(self, key: str) -> None:
-        """Drop one reference; the entry becomes evictable at zero."""
-        if key not in self._entries:
-            return
-        count = self._refs[key] - 1
-        if count > 0:
-            self._refs[key] = count
-            return
-        self._refs.pop(key, None)
-        self._evictable[key] = None
-
-    def evict_lru(self, evict: Callable[[str, _T], bool]) -> str | None:
-        """Drop the oldest entry `evict` accepts, and return its key.
-
-        `evict` returns False for an entry that cannot go yet (a lease the
-        remote side still holds, a deregistration that failed). Those keep
-        their place in the order and the next candidate is tried.
-        """
-        for key in list(self._evictable):
-            value, nbytes = self._entries[key]
-            if not evict(key, value):
-                continue
-            self._evictable.pop(key, None)
-            del self._entries[key]
-            self._refs.pop(key, None)
-            self.used -= nbytes
-            return key
-        return None
-
-    def clear(self) -> None:
-        self._entries.clear()
-        self._refs.clear()
-        self._evictable.clear()
-        self.used = 0
-
-
-class _ContiguousAllocator:
-    def __init__(self, capacity: int, alignment: int = 256):
-        self.capacity = capacity
-        self.alignment = alignment
-        self._free = [(0, capacity)]
-
-    def allocate(self, nbytes: int) -> tuple[int, int] | None:
-        size = math.ceil(nbytes / self.alignment) * self.alignment
-        for index, (offset, available) in enumerate(self._free):
-            if size > available:
-                continue
-            if size == available:
-                self._free.pop(index)
-            else:
-                self._free[index] = (offset + size, available - size)
-            return offset, size
-        return None
-
-    def free(self, offset: int, size: int) -> None:
-        index = bisect.bisect_left(self._free, (offset, size))
-        self._free.insert(index, (offset, size))
-        # Coalesce with the neighbours only; the rest of the list is already
-        # merged, so a full re-scan per free is wasted work.
-        if index + 1 < len(self._free):
-            next_offset, next_size = self._free[index + 1]
-            if offset + size == next_offset:
-                self._free[index] = (offset, size + next_size)
-                self._free.pop(index + 1)
-        if index > 0:
-            previous_offset, previous_size = self._free[index - 1]
-            current_offset, current_size = self._free[index]
-            if previous_offset + previous_size == current_offset:
-                self._free[index - 1] = (
-                    previous_offset,
-                    previous_size + current_size,
-                )
-                self._free.pop(index)
 
 
 class ECMooncakeWorker:
@@ -346,42 +181,29 @@ class ECMooncakeWorker:
         self.is_consumer = config.is_consumer
         self._buffer_device = config.buffer_device
         self._reservation_zmq_port = config.reservation_port
-        self._consumer_pool_capacity = config.consumer_pool_size
-        self._consumer_pool: torch.Tensor | None = None
-        self._consumer_pool_allocator: _ContiguousAllocator | None = None
-        # The receive pool is orders of magnitude larger than the encoder
-        # cache, so an item the encoder cache evicted stays resident here and
-        # a later request gets it for a dict lookup instead of a transfer.
-        self._consumer_residents: _ResidentPool[_ConsumerPoolAllocation] = (
-            _ResidentPool(self._consumer_pool_capacity)
+        self._transfer = MooncakeTransfer(hostname, config.protocol)
+        self._consumer_worker_metrics: Counter[str] = Counter()
+        self._consumer_memory = ConsumerMemoryPool(
+            config.consumer_pool_size,
+            self._transfer,
         )
-        self._consumer_retire_events: dict[str, torch.Event] = {}
-        self._consumer_pending_frees: list[
-            tuple[torch.Event, _ConsumerPoolAllocation]
-        ] = []
-        self._consumer_reclaimed: set[str] = set()
         self._consumer_rank_resolved = False
         self._is_receiving_rank = True
         self._tp_rank = 0
         self._tp_size = 1
-        self._consumer_pool_disabled = False
-        self._consumer_lock = threading.Lock()
         self._push_reservations: dict[str, _PushReservation] = {}
         self._cancelled_transfers: OrderedDict[str, float] = OrderedDict()
         self._control_server: ConsumerControlServer | None = None
         self._consumer_metrics_log_interval = config.consumer_metrics_log_interval
         self._consumer_metrics_started_at = time.monotonic()
-        self._consumer_worker_metrics: Counter[str] = Counter()
         self._active_push_sources: Counter[tuple[str, int]] = Counter()
         self._active_push_sources_lock = threading.Lock()
 
         # Worker producer
-        self._transfer = MooncakeTransfer(hostname, config.protocol)
-        self._producer_pool_capacity = config.producer_pool_size
-        self._producer_pool: torch.Tensor | None = None
-        self._producer_pool_allocator: _ContiguousAllocator | None = None
-        self._producer_pool_disabled = False
-        self._producer_pool_lock = threading.Lock()
+        self._producer_memory = ProducerMemoryPool(
+            config.producer_pool_size,
+            self._transfer,
+        )
         self._transfer_metrics_log_interval = config.transfer_metrics_log_interval
         self._control_client = control_client
         self._topology = topology
@@ -451,8 +273,13 @@ class ECMooncakeWorker:
         device_name = (
             raw_device.lower() if isinstance(raw_device, str) and raw_device else "cuda"
         )
-        self._ensure_consumer_pool(torch.device(device_name), allow_host=True)
-        if self._consumer_pool is None:
+        self._consumer_memory.prepare(
+            torch.device(device_name),
+            receiving_rank=self._is_receiving_rank,
+            allow_host=True,
+        )
+        consumer_pool = self._consumer_memory.tensor
+        if consumer_pool is None:
             raise RuntimeError(
                 "Mooncake push mode requires a registered consumer buffer pool."
             )
@@ -467,7 +294,7 @@ class ECMooncakeWorker:
             self._expire_push_reservations,
             self._consumer_metrics_log_interval,
             peer_ports=[base_port + rank for rank in range(self._tp_size)],
-            device=self._consumer_pool.device,
+            device=consumer_pool.device,
         )
         try:
             self._control_server.start()
@@ -475,207 +302,6 @@ class ECMooncakeWorker:
             self._control_server.close()
             self._control_server = None
             raise
-
-    def _ensure_consumer_pool(
-        self, device: torch.device, *, allow_host: bool = False
-    ) -> None:
-        if (
-            self._consumer_pool is not None
-            or self._consumer_pool_disabled
-            or (device.type != "cuda" and not allow_host)
-        ):
-            return
-        try:
-            pool = torch.empty(
-                self._consumer_pool_capacity, dtype=torch.uint8, device=device
-            )
-            if self._is_receiving_rank:
-                # Producers write into this pool directly, so it needs a memory
-                # region. Later pipeline stages never receive and skip it.
-                ret = self._transfer.register_memory(pool)
-                if ret != 0:
-                    raise RuntimeError(f"Mooncake returned {ret}")
-        except (RuntimeError, torch.OutOfMemoryError) as e:
-            self._consumer_pool_disabled = True
-            logger.warning(
-                "Could not initialize the EC consumer buffer pool; falling back "
-                "to per-tensor registration: %s",
-                e,
-            )
-            return
-        self._consumer_pool = pool
-        self._consumer_pool_allocator = _ContiguousAllocator(pool.nbytes)
-        logger.info(
-            "Prepared %d-byte CUDA receive pool for Mooncake EC (registered=%s)",
-            pool.nbytes,
-            self._is_receiving_rank,
-        )
-
-    def _ensure_producer_pool(self, device: torch.device) -> None:
-        """Register one staging slab so pushes never register per transfer.
-
-        Registering the encoder output itself costs more than the transfer
-        (register+unregister dominated the push path); staging into a slab
-        that is registered once trades that for a device-to-device copy.
-        """
-        if self._producer_pool is not None or self._producer_pool_disabled:
-            return
-        with self._producer_pool_lock:
-            if self._producer_pool is not None or self._producer_pool_disabled:
-                return
-            try:
-                pool = torch.empty(
-                    self._producer_pool_capacity, dtype=torch.uint8, device=device
-                )
-                ret = self._transfer.register_memory(pool)
-                if ret != 0:
-                    raise RuntimeError(f"Mooncake returned {ret}")
-            except (RuntimeError, torch.OutOfMemoryError) as e:
-                self._producer_pool_disabled = True
-                logger.warning(
-                    "Could not initialize the EC producer staging pool; falling "
-                    "back to per-transfer registration: %s",
-                    e,
-                )
-                return
-            self._producer_pool = pool
-            self._producer_pool_allocator = _ContiguousAllocator(pool.nbytes)
-            logger.info(
-                "Registered %d-byte staging pool for Mooncake EC pushes",
-                pool.nbytes,
-            )
-
-    def _stage_push_sources(
-        self, tensors: list[torch.Tensor]
-    ) -> tuple[list[torch.Tensor], list[tuple[int, int]]] | None:
-        """Copy the batch into the staging pool; None if it does not fit."""
-        if not tensors:
-            return [], []
-        self._ensure_producer_pool(tensors[0].device)
-        pool = self._producer_pool
-        allocator = self._producer_pool_allocator
-        if pool is None or allocator is None:
-            return None
-        staged: list[torch.Tensor] = []
-        regions: list[tuple[int, int]] = []
-        with self._producer_pool_lock:
-            for tensor in tensors:
-                region = allocator.allocate(tensor.nbytes)
-                if region is None:
-                    for offset, size in regions:
-                        allocator.free(offset, size)
-                    return None
-                regions.append(region)
-                offset = region[0]
-                staged.append(
-                    pool.narrow(0, offset, tensor.nbytes)
-                    .view(tensor.dtype)
-                    .view(tensor.shape)
-                )
-        for destination, source in zip(staged, tensors):
-            destination.copy_(source, non_blocking=True)
-        return staged, regions
-
-    def _release_push_staging(self, regions: list[tuple[int, int]]) -> None:
-        allocator = self._producer_pool_allocator
-        if allocator is None or not regions:
-            return
-        with self._producer_pool_lock:
-            for offset, size in regions:
-                allocator.free(offset, size)
-
-    def _poll_consumer_pool_frees(self) -> None:
-        allocator = self._consumer_pool_allocator
-        if allocator is None:
-            return
-        with self._consumer_lock:
-            pending = []
-            for event, allocation in self._consumer_pending_frees:
-                if event.query():
-                    allocator.free(allocation.offset, allocation.size)
-                else:
-                    pending.append((event, allocation))
-            self._consumer_pending_frees = pending
-
-    def _reclaim_residents_locked(
-        self, allocator: _ContiguousAllocator, nbytes: int
-    ) -> tuple[int, int] | None:
-        """Give up retired items, oldest first, until `nbytes` fits.
-
-        Called only when the pool cannot satisfy an allocation, so a retired
-        item survives until its memory is genuinely needed.
-        """
-
-        def evict(mm_hash: str, allocation: _ConsumerPoolAllocation) -> bool:
-            event = self._consumer_retire_events.pop(mm_hash, None)
-            if event is None or event.query():
-                allocator.free(allocation.offset, allocation.size)
-            else:
-                self._consumer_pending_frees.append((event, allocation))
-            self._consumer_reclaimed.add(mm_hash)
-            self._consumer_worker_metrics["residents_reclaimed"] += 1
-            return True
-
-        while self._consumer_residents.evict_lru(evict) is not None:
-            region = allocator.allocate(nbytes)
-            if region is not None:
-                return region
-        return None
-
-    def _take_resident_tensor(self, spec: ECMooncakeLoadSpec) -> torch.Tensor | None:
-        """Hand back a copy the pool still holds.
-
-        Retired and in-use entries live in the same map, so an item a later
-        push reserved again still serves this load.
-        """
-        with self._consumer_lock:
-            allocation = self._consumer_residents.get(spec.mm_hash)
-            if allocation is None:
-                self._consumer_worker_metrics["residents_missed"] += 1
-                return None
-            tensor = allocation.tensor
-            if (
-                tuple(tensor.shape) != tuple(spec.shape)
-                or str(tensor.dtype).split(".")[-1] != spec.dtype
-            ):
-                self._consumer_worker_metrics["residents_mismatched"] += 1
-                return None
-            self._consumer_residents.pin(spec.mm_hash)
-            self._consumer_retire_events.pop(spec.mm_hash, None)
-            self._consumer_worker_metrics["residents_promoted"] += 1
-            return tensor
-
-    def _release_stale_consumer_allocations(
-        self, encoder_cache: dict[str, torch.Tensor]
-    ) -> None:
-        if self._consumer_pool is None:
-            return
-        with self._consumer_lock:
-            reserved_allocations = {
-                id(reservation.allocation)
-                for reservation in self._push_reservations.values()
-            }
-            # Walk only the referenced entries: the retired set grows to
-            # thousands and none of it can change state here.
-            for mm_hash in self._consumer_residents.referenced():
-                allocation = self._consumer_residents.get(mm_hash)
-                if allocation is None:
-                    continue
-                if encoder_cache.get(mm_hash) is allocation.tensor:
-                    continue
-                if id(allocation) in reserved_allocations:
-                    continue
-                # Retire rather than free: the bytes stay valid and serve the
-                # next request that needs this item. The event orders the
-                # eventual reuse behind whatever still reads the tensor.
-                event = torch.Event()
-                event.record(
-                    torch.accelerator.current_stream(self._consumer_pool.device)
-                )
-                self._consumer_retire_events[mm_hash] = event
-                self._consumer_residents.retire(mm_hash)
-                self._consumer_worker_metrics["residents_retired"] += 1
-        self._poll_consumer_pool_frees()
 
     @staticmethod
     def _hash_samples(values: list[str], limit: int = 5) -> list[str]:
@@ -689,7 +315,7 @@ class ECMooncakeWorker:
             < self._consumer_metrics_log_interval
         ):
             return
-        with self._consumer_lock:
+        with self._consumer_memory.lock:
             ready = [
                 mm_hash
                 for mm_hash, reservation in self._push_reservations.items()
@@ -702,10 +328,8 @@ class ECMooncakeWorker:
             ]
             metrics = dict(self._consumer_worker_metrics)
             self._consumer_worker_metrics.clear()
-            residents = len(self._consumer_residents)
-            live = len(self._consumer_residents.referenced())
-            retired = self._consumer_residents.num_evictable
-            pending_frees = len(self._consumer_pending_frees)
+            metrics.update(self._consumer_memory.take_metrics())
+            residents, live, retired, pending_frees = self._consumer_memory.stats()
             oldest_reservation_ms = max(
                 (
                     (now - reservation.created_at) * 1000
@@ -738,7 +362,7 @@ class ECMooncakeWorker:
         Both roles keep one record per multimodal item they handle, and both
         consult it on a per-item hot path, so a full rescan costs the square
         of the item rate: at 53 items/s the worker's 300 s window is 16k
-        entries and its sweep ran under `_consumer_lock` on every
+        entries and its sweep ran under the consumer memory lock on every
         reservation. Callers append in deadline order -- `move_to_end` when
         refreshing one -- so the front is always the oldest and the sweep
         stops at the first live entry.
@@ -755,17 +379,19 @@ class ECMooncakeWorker:
             dropped += 1
         return dropped
 
+    def _release_reservation_allocation(self, reservation: _PushReservation) -> None:
+        if reservation.owns_allocation:
+            self._consumer_memory.free(reservation.allocation)
+        elif reservation.resident_lease is not None:
+            self._consumer_memory.release_cached(reservation.resident_lease)
+            reservation.resident_lease = None
+
     def _expire_push_reservations_locked(self) -> None:
         now = time.monotonic()
-        allocator = self._consumer_pool_allocator
-        assert allocator is not None
         for transfer_id, reservation in list(self._push_reservations.items()):
             if reservation.expires_at > now:
                 continue
-            if reservation.owns_allocation:
-                allocator.free(
-                    reservation.allocation.offset, reservation.allocation.size
-                )
+            self._release_reservation_allocation(reservation)
             self._push_reservations.pop(transfer_id)
             self._consumer_worker_metrics["reservations_expired"] += 1
         self._consumer_worker_metrics["cancel_records_dropped"] += (
@@ -773,7 +399,7 @@ class ECMooncakeWorker:
         )
 
     def _expire_push_reservations(self) -> int:
-        with self._consumer_lock:
+        with self._consumer_memory.lock:
             before = len(self._push_reservations)
             self._expire_push_reservations_locked()
             return before - len(self._push_reservations)
@@ -791,7 +417,7 @@ class ECMooncakeWorker:
         if expected_nbytes != nbytes:
             raise ValueError("shape and dtype do not match nbytes")
 
-        with self._consumer_lock:
+        with self._consumer_memory.lock:
             self._expire_push_reservations_locked()
             if transfer_id in self._cancelled_transfers:
                 self._consumer_worker_metrics["reservations_cancelled_early"] += 1
@@ -823,43 +449,38 @@ class ECMooncakeWorker:
                 if not existing.ready:
                     existing.expires_at = time.monotonic() + _LEASE_TTL_SECONDS
             else:
-                cached = self._consumer_residents.get(mm_hash)
-                if cached is not None:
-                    if (
-                        tuple(cached.tensor.shape) != shape
-                        or cached.tensor.dtype != dtype
-                    ):
-                        raise ValueError("conflicting cached tensor for mm_hash")
+                resident_lease = self._consumer_memory.acquire_cached(
+                    mm_hash, shape, dtype
+                )
+                if resident_lease is not None:
                     reservation = _PushReservation(
                         mm_hash=mm_hash,
                         reservation_id=uuid.uuid4().hex,
-                        allocation=cached,
+                        allocation=resident_lease.value,
                         shape=shape,
                         dtype=dtype_name,
                         ready=True,
                         owns_allocation=False,
+                        resident_lease=resident_lease,
                         expires_at=time.monotonic() + _LEASE_TTL_SECONDS,
                     )
                     should_write = False
-                    # Live again: it must not be reclaimed under pressure.
-                    self._consumer_residents.pin(mm_hash)
-                    self._consumer_retire_events.pop(mm_hash, None)
                     self._consumer_worker_metrics["reservations_cached"] += 1
                 else:
-                    pool = self._consumer_pool
-                    allocator = self._consumer_pool_allocator
-                    assert pool is not None and allocator is not None
-                    region = allocator.allocate(nbytes)
-                    if region is None:
+                    allocation = self._consumer_memory.try_allocate(
+                        nbytes, shape, dtype
+                    )
+                    if allocation is None:
                         self._expire_push_reservations_locked()
-                        region = allocator.allocate(nbytes)
-                    if region is None:
-                        region = self._reclaim_residents_locked(allocator, nbytes)
-                    if region is None:
+                        allocation = self._consumer_memory.try_allocate(
+                            nbytes, shape, dtype
+                        )
+                    if allocation is None:
+                        allocation = self._consumer_memory.reclaim_and_allocate(
+                            nbytes, shape, dtype
+                        )
+                    if allocation is None:
                         raise RuntimeError("EC consumer buffer pool is full")
-                    offset, size = region
-                    tensor = pool.narrow(0, offset, nbytes).view(dtype).view(shape)
-                    allocation = _ConsumerPoolAllocation(offset, size, tensor)
                     reservation = _PushReservation(
                         mm_hash=mm_hash,
                         reservation_id=uuid.uuid4().hex,
@@ -883,7 +504,7 @@ class ECMooncakeWorker:
         }
 
     def _push_status(self, transfer_id: str) -> dict[str, Any] | None:
-        with self._consumer_lock:
+        with self._consumer_memory.lock:
             reservation = self._push_reservations.get(transfer_id)
             if reservation is None:
                 return None
@@ -899,7 +520,7 @@ class ECMooncakeWorker:
     def _complete_push(
         self, transfer_id: str, reservation_id: str
     ) -> ControlCompletion:
-        with self._consumer_lock:
+        with self._consumer_memory.lock:
             reservation = self._push_reservations.get(transfer_id)
             if reservation is None or reservation.reservation_id != reservation_id:
                 self._consumer_worker_metrics["completions_rejected"] += 1
@@ -909,13 +530,8 @@ class ECMooncakeWorker:
                 return ControlCompletion(True)
             self._consumer_worker_metrics["completions_accepted"] += 1
             if reservation.discard_on_complete:
-                allocator = self._consumer_pool_allocator
-                assert allocator is not None
                 self._push_reservations.pop(transfer_id)
-                if reservation.owns_allocation:
-                    allocator.free(
-                        reservation.allocation.offset, reservation.allocation.size
-                    )
+                self._release_reservation_allocation(reservation)
                 self._consumer_worker_metrics["reservations_discarded"] += 1
                 return ControlCompletion(True)
             reservation.ready = True
@@ -925,7 +541,7 @@ class ECMooncakeWorker:
     def _cancel_push(
         self, transfer_id: str, reservation_id: str, abandon: bool = False
     ) -> bool:
-        with self._consumer_lock:
+        with self._consumer_memory.lock:
             reservation = self._push_reservations.get(transfer_id)
             if (
                 reservation is not None
@@ -941,24 +557,19 @@ class ECMooncakeWorker:
             if reservation is None:
                 self._consumer_worker_metrics["cancellations_pre_reserved"] += 1
                 return True
-            allocator = self._consumer_pool_allocator
-            assert allocator is not None
             if not reservation.ready and not abandon:
                 reservation.discard_on_complete = True
                 self._consumer_worker_metrics["cancellations_deferred"] += 1
                 return True
             self._push_reservations.pop(transfer_id)
-            if reservation.owns_allocation:
-                allocator.free(
-                    reservation.allocation.offset, reservation.allocation.size
-                )
+            self._release_reservation_allocation(reservation)
             self._consumer_worker_metrics["reservations_cancelled"] += 1
             return True
 
     def _take_pushed_tensor(
         self, spec: ECMooncakeLoadSpec
-    ) -> tuple[torch.Tensor, _ConsumerPoolAllocation]:
-        with self._consumer_lock:
+    ) -> tuple[torch.Tensor, MemoryAllocation]:
+        with self._consumer_memory.lock:
             reservation = self._push_reservations.get(spec.transfer_id)
             # Not compared against `spec.reservation_id`: each shard mints its
             # own, while the spec carries the one from whichever shard's event
@@ -971,11 +582,14 @@ class ECMooncakeWorker:
                     f"Pushed EC tensor is not ready for mm_hash={spec.mm_hash}"
                 )
             self._push_reservations.pop(spec.transfer_id)
-            self._consumer_residents.insert(
-                spec.mm_hash, reservation.allocation, reservation.allocation.size
+            allocation = self._consumer_memory.publish(
+                spec.mm_hash,
+                reservation.allocation,
+                reservation.resident_lease,
             )
+            reservation.resident_lease = None
             self._consumer_worker_metrics["reservations_taken"] += 1
-            return reservation.allocation.tensor, reservation.allocation
+            return allocation.tensor, allocation
 
     def _shard_executor(self) -> ThreadPoolExecutor:
         """Threads for the extra shards of a sharded consumer.
@@ -1083,7 +697,11 @@ class ECMooncakeWorker:
             raise RuntimeError(
                 "ECMooncakeConnector requires CUDA for ec_buffer_device=cuda"
             )
-        self._release_stale_consumer_allocations(encoder_cache)
+        with self._consumer_memory.lock:
+            reserved_hashes = {
+                reservation.mm_hash for reservation in self._push_reservations.values()
+            }
+            self._consumer_memory.retire_stale(encoder_cache, reserved_hashes)
 
         for spec in metadata.loads:
             if spec.mm_hash in encoder_cache:
@@ -1093,7 +711,9 @@ class ECMooncakeWorker:
                 self._completed_loads.add(spec.mm_hash)
                 continue
             if spec.local:
-                resident = self._take_resident_tensor(spec)
+                resident = self._consumer_memory.take_resident(
+                    spec.mm_hash, tuple(spec.shape), spec.dtype
+                )
                 if resident is None:
                     # Reclaimed before the scheduler heard about it; the load
                     # falls back to a transfer on a later step.
@@ -1187,11 +807,10 @@ class ECMooncakeWorker:
                 tensors = [push.tensor for push in unique]
                 lengths = [tensor.nbytes for tensor in tensors]
                 stage_started_at = time.monotonic()
-                staged = self._stage_push_sources(tensors)
+                staged = self._producer_memory.stage(tensors)
                 registered_sources: list[int] = []
-                staged_regions: list[tuple[int, int]] = []
                 if staged is not None:
-                    sources, staged_regions = staged
+                    sources = staged.tensors
                     # The NIC reads outside the CUDA stream, so the staging
                     # copies have to have landed before the transfer starts.
                     if sources and sources[0].device.type == "cuda":
@@ -1235,7 +854,8 @@ class ECMooncakeWorker:
                     stage_ms["rdma"] = (time.monotonic() - stage_started_at) * 1000
                 finally:
                     stage_started_at = time.monotonic()
-                    self._release_push_staging(staged_regions)
+                    if staged is not None:
+                        self._producer_memory.release(staged)
                     self._transfer.release_sources(registered_sources)
                     stage_ms["unregister"] = (
                         time.monotonic() - stage_started_at
@@ -1537,9 +1157,7 @@ class ECMooncakeWorker:
                 logger.exception(
                     "EC Mooncake async save failed for mm_hash=%s", mm_hash
                 )
-        with self._consumer_lock:
-            reclaimed = self._consumer_reclaimed
-            self._consumer_reclaimed = set()
+        reclaimed = self._consumer_memory.drain_reclaimed()
         meta = ECMooncakeWorkerMetadata(
             loaded=self._completed_loads,
             failed_loads=self._failed_loads,
@@ -1566,14 +1184,8 @@ class ECMooncakeWorker:
         self._control_client.close()
         if self._control_server is not None:
             self._control_server.close()
-        if self._consumer_pool is not None and self._transfer.unregister_memory(
-            self._consumer_pool
-        ):
-            self._consumer_pool = None
-            self._consumer_pool_allocator = None
-            self._consumer_residents.clear()
-            self._consumer_retire_events.clear()
-            self._consumer_pending_frees.clear()
+        self._consumer_memory.close()
+        self._producer_memory.close()
         self._transfer.close()
 
     def __del__(self) -> None:

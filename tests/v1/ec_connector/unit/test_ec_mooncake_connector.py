@@ -32,6 +32,7 @@ from vllm.distributed.ec_transfer.ec_connector.base import (
 from vllm.distributed.ec_transfer.ec_connector.factory import ECConnectorFactory
 from vllm.distributed.ec_transfer.ec_connector.mooncake import (
     control,
+    memory,
     metadata,
     transfer,
 )
@@ -43,6 +44,12 @@ from vllm.distributed.ec_transfer.ec_connector.mooncake.control import (
     EventInbox,
     ShardTopology,
 )
+from vllm.distributed.ec_transfer.ec_connector.mooncake.memory import (
+    ConsumerMemoryPool,
+    ContiguousAllocator,
+    ProducerMemoryPool,
+    ResidentPool,
+)
 from vllm.distributed.ec_transfer.ec_connector.mooncake.scheduler import (
     ECMooncakeScheduler,
 )
@@ -52,8 +59,6 @@ from vllm.distributed.ec_transfer.ec_connector.mooncake.transfer import (
 from vllm.distributed.ec_transfer.ec_connector.mooncake.worker import (
     _LEASE_TTL_SECONDS,
     ECMooncakeWorker,
-    _ConsumerPoolAllocation,
-    _ContiguousAllocator,
 )
 from vllm.distributed.ec_transfer.ec_connector.mooncake_ec_connector import (
     ECMooncakeConnector,
@@ -610,7 +615,7 @@ class TestECMooncakeFactory:
 
 class TestContiguousAllocator:
     def test_reuses_and_coalesces_contiguous_regions(self):
-        allocator = _ContiguousAllocator(1024, alignment=256)
+        allocator = ContiguousAllocator(1024, alignment=256)
 
         first = allocator.allocate(1)
         second = allocator.allocate(300)
@@ -621,6 +626,192 @@ class TestContiguousAllocator:
         allocator.free(*first)
         allocator.free(*second)
         assert allocator.allocate(1024) == (0, 1024)
+
+    def test_splits_until_exhausted(self):
+        allocator = ContiguousAllocator(768, alignment=256)
+
+        assert allocator.allocate(257) == (0, 512)
+        assert allocator.allocate(1) == (512, 256)
+        assert allocator.allocate(1) is None
+
+
+class TestResidentPool:
+    def test_lru_skips_rejected_entry_and_replaces_without_losing_owner(self):
+        pool = ResidentPool[str]()
+        pool.insert("oldest", "first", 256)
+        pool.insert("next", "second", 256)
+        pool.retire("oldest")
+        pool.retire("next")
+
+        evicted = pool.evict_lru(lambda key, _: key != "oldest")
+
+        assert evicted == "next"
+        assert pool.get("oldest") == "first"
+        assert pool.insert("oldest", "replacement", 128) == "first"
+        assert pool.get("oldest") == "replacement"
+        assert pool.used == 128
+
+    def test_displaced_entry_waits_for_every_lease(self):
+        pool = ResidentPool[str]()
+        pool.insert("hash", "original", 256)
+        first = pool.acquire("hash")
+        second = pool.acquire("hash")
+        assert first is not None and second is not None
+
+        assert pool.insert("hash", "replacement", 256) is None
+        assert pool.used == 512
+        assert pool.release(first) is None
+        assert pool.release(second) == "original"
+        assert pool.used == 256
+        assert pool.release(second) is None
+
+
+class TestMooncakeMemoryPools:
+    class _Event:
+        def __init__(self, complete: bool):
+            self.complete = complete
+
+        def record(self, stream):
+            pass
+
+        def query(self):
+            return self.complete
+
+    def test_consumer_replacement_waits_for_cached_owner(self):
+        mooncake_transfer = MagicMock(spec=MooncakeTransfer)
+        mooncake_transfer.register_memory.return_value = 0
+        mooncake_transfer.unregister_memory.return_value = True
+        pool = ConsumerMemoryPool(768, mooncake_transfer)
+        pool.prepare(torch.device("cpu"), receiving_rank=True, allow_host=True)
+        first = pool.try_allocate(64, (16,), torch.float32)
+        replacement = pool.try_allocate(64, (16,), torch.float32)
+        assert first is not None and replacement is not None
+        pool.publish("hash", first)
+        held = pool.acquire_cached("hash", (16,), torch.float32)
+        assert held is not None
+        pool.publish("hash", replacement)
+
+        third = pool.try_allocate(64, (16,), torch.float32)
+        assert third is not None
+        assert third.offset != first.offset
+
+        pool.release_cached(held)
+        reused = pool.try_allocate(64, (16,), torch.float32)
+        assert reused is not None
+        assert reused.offset == first.offset
+        assert pool.take_resident("hash", (16,), "float32") is replacement.tensor
+
+    def test_cached_consume_returns_newer_canonical_allocation(self):
+        mooncake_transfer = MagicMock(spec=MooncakeTransfer)
+        mooncake_transfer.register_memory.return_value = 0
+        pool = ConsumerMemoryPool(768, mooncake_transfer)
+        pool.prepare(torch.device("cpu"), receiving_rank=True, allow_host=True)
+        first = pool.try_allocate(64, (16,), torch.float32)
+        replacement = pool.try_allocate(64, (16,), torch.float32)
+        assert first is not None and replacement is not None
+        pool.publish("hash", first)
+        held = pool.acquire_cached("hash", (16,), torch.float32)
+        assert held is not None
+        pool.publish("hash", replacement)
+
+        canonical = pool.publish("hash", held.value, held)
+
+        assert canonical is replacement
+        reused = pool.try_allocate(64, (16,), torch.float32)
+        assert reused is not None
+        assert reused.offset == first.offset
+
+    def test_consumer_defers_retired_reuse_until_event_completes(self):
+        mooncake_transfer = MagicMock(spec=MooncakeTransfer)
+        mooncake_transfer.register_memory.return_value = 0
+        pool = ConsumerMemoryPool(256, mooncake_transfer)
+        pool.prepare(torch.device("cpu"), receiving_rank=True, allow_host=True)
+        allocation = pool.try_allocate(64, (16,), torch.float32)
+        assert allocation is not None
+        pool.publish("hash", allocation)
+        event = self._Event(complete=False)
+
+        with (
+            patch.object(memory.torch, "Event", return_value=event),
+            patch.object(memory.torch.accelerator, "current_stream"),
+        ):
+            pool.retire_stale({}, set())
+            assert pool.reclaim_and_allocate(64, (16,), torch.float32) is None
+            event.complete = True
+            reused = pool.try_allocate(64, (16,), torch.float32)
+
+        assert reused is not None
+        assert reused.offset == allocation.offset
+        assert pool.drain_reclaimed() == {"hash"}
+
+    def test_consumer_registration_failure_disables_pool(self):
+        mooncake_transfer = MagicMock(spec=MooncakeTransfer)
+        mooncake_transfer.register_memory.return_value = 1
+        pool = ConsumerMemoryPool(256, mooncake_transfer)
+
+        pool.prepare(torch.device("cpu"), receiving_rank=True, allow_host=True)
+        pool.prepare(torch.device("cpu"), receiving_rank=True, allow_host=True)
+
+        assert pool.tensor is None
+        mooncake_transfer.register_memory.assert_called_once()
+
+    def test_nonreceiving_consumer_never_registers_or_unregisters_pool(self):
+        mooncake_transfer = MagicMock(spec=MooncakeTransfer)
+        pool = ConsumerMemoryPool(256, mooncake_transfer)
+
+        pool.prepare(torch.device("cpu"), receiving_rank=False, allow_host=True)
+        pool.close()
+        pool.close()
+
+        assert pool.tensor is None
+        mooncake_transfer.register_memory.assert_not_called()
+        mooncake_transfer.unregister_memory.assert_not_called()
+
+    def test_consumer_close_unregisters_once_and_releases_parent(self):
+        mooncake_transfer = MagicMock(spec=MooncakeTransfer)
+        mooncake_transfer.register_memory.return_value = 0
+        mooncake_transfer.unregister_memory.return_value = True
+        pool = ConsumerMemoryPool(256, mooncake_transfer)
+        pool.prepare(torch.device("cpu"), receiving_rank=True, allow_host=True)
+        parent = pool.tensor
+
+        pool.close()
+        pool.close()
+
+        mooncake_transfer.unregister_memory.assert_called_once_with(parent)
+        assert pool.tensor is None
+
+    def test_producer_reuses_staging_and_keeps_parent_for_later_close_phase(self):
+        mooncake_transfer = MagicMock(spec=MooncakeTransfer)
+        mooncake_transfer.register_memory.return_value = 0
+        pool = ProducerMemoryPool(256, mooncake_transfer)
+        source = torch.arange(16, dtype=torch.float32)
+
+        first = pool.stage([source])
+        assert first is not None
+        assert torch.equal(first.tensors[0], source)
+        pool.release(first)
+        second = pool.stage([source])
+        assert second is not None
+        assert second.regions == first.regions
+        pool.release(second)
+        parent = pool.tensor
+
+        pool.close()
+        pool.close()
+
+        assert pool.tensor is parent
+        mooncake_transfer.unregister_memory.assert_not_called()
+
+    def test_producer_falls_back_when_staging_pool_allocation_fails(self):
+        mooncake_transfer = MagicMock(spec=MooncakeTransfer)
+        pool = ProducerMemoryPool(256, mooncake_transfer)
+
+        with patch.object(memory.torch, "empty", side_effect=torch.OutOfMemoryError):
+            assert pool.stage([torch.ones(16)]) is None
+            assert pool.stage([torch.ones(16)]) is None
+
+        mooncake_transfer.register_memory.assert_not_called()
 
 
 class TestMooncakeECConfig:
@@ -2162,6 +2353,46 @@ class TestECMooncakeSchedulerMetadata:
 
 
 class TestECMooncakeWorkerTransfer:
+    def test_reservation_snapshot_and_resident_retirement_are_atomic(self):
+        worker = object.__new__(ECMooncakeWorker)
+        worker._resolve_consumer_rank = Mock()
+        worker._is_receiving_rank = True
+        worker._transfer = Mock()
+        worker._buffer_device = "cpu"
+        worker._push_reservations = {}
+        worker._consumer_memory = ConsumerMemoryPool(256, Mock())
+        retire_entered = threading.Event()
+        finish_retire = threading.Event()
+        lock_acquired = threading.Event()
+
+        def retire_stale(*args):
+            retire_entered.set()
+            assert finish_retire.wait(2)
+
+        def load():
+            worker.start_load_caches(ECMooncakeConnectorMetadata(), {})
+
+        def update_reservations():
+            with worker._consumer_memory.lock:
+                lock_acquired.set()
+
+        with patch.object(
+            worker._consumer_memory, "retire_stale", side_effect=retire_stale
+        ):
+            load_thread = threading.Thread(target=load)
+            load_thread.start()
+            assert retire_entered.wait(2)
+            update_thread = threading.Thread(target=update_reservations)
+            update_thread.start()
+            assert not lock_acquired.wait(0.05)
+            finish_retire.set()
+            load_thread.join(2)
+            update_thread.join(2)
+
+        assert not load_thread.is_alive()
+        assert not update_thread.is_alive()
+        assert lock_acquired.is_set()
+
     def test_control_server_start_failure_closes_server(
         self, mock_vllm_config_consumer
     ):
@@ -2187,6 +2418,68 @@ class TestECMooncakeWorkerTransfer:
                     connector.start_worker_services()
                 server_cls.return_value.close.assert_called_once_with()
                 assert connector._worker._control_server is None
+            finally:
+                connector.shutdown()
+
+    def test_expiry_retries_allocation_before_reclaiming_resident(
+        self, mock_vllm_config_consumer
+    ):
+        config = mock_vllm_config_consumer
+        config.ec_transfer_config.ec_buffer_device = "cpu"
+        config.ec_transfer_config.ec_buffer_size = 512
+        config.ec_transfer_config.ec_connector_extra_config[
+            "consumer_buffer_pool_size"
+        ] = 512
+
+        def payload(transfer_id: str, mm_hash: str) -> dict[str, object]:
+            return {
+                "transfer_id": transfer_id,
+                "mm_hash": mm_hash,
+                "nbytes": 64,
+                "shape": [16],
+                "dtype": "float32",
+            }
+
+        with patch_ec_mooncake_deps():
+            connector = ECMooncakeConnector(config, ECConnectorRole.WORKER)
+            worker = connector._worker
+            memory_pool = worker._consumer_memory
+            try:
+                memory_pool.prepare(
+                    torch.device("cpu"), receiving_rank=True, allow_host=True
+                )
+                resident = memory_pool.try_allocate(64, (16,), torch.float32)
+                assert resident is not None
+                memory_pool.publish("resident", resident)
+                retire_event = MagicMock()
+                retire_event.query.return_value = True
+                with (
+                    patch.object(memory.torch, "Event", return_value=retire_event),
+                    patch.object(memory.torch.accelerator, "current_stream"),
+                ):
+                    memory_pool.retire_stale({}, set())
+                old = worker._reserve_push_destination(payload("old", "old"))
+                worker._push_reservations["old"].expires_at = float("inf")
+                try_allocate = memory_pool.try_allocate
+                first_attempt = True
+
+                def expire_between_attempts(*args):
+                    nonlocal first_attempt
+                    if first_attempt:
+                        first_attempt = False
+                        worker._push_reservations["old"].expires_at = 0
+                        return None
+                    return try_allocate(*args)
+
+                with patch.object(
+                    memory_pool,
+                    "try_allocate",
+                    side_effect=expire_between_attempts,
+                ):
+                    new = worker._reserve_push_destination(payload("new", "new"))
+
+                assert new["dst_ptr"] == old["dst_ptr"]
+                assert memory_pool.drain_reclaimed() == set()
             finally:
                 connector.shutdown()
 
@@ -2535,19 +2828,22 @@ class TestECMooncakeWorkerTransfer:
         with patch_ec_mooncake_deps():
             consumer = ECMooncakeConnector(cfg, ECConnectorRole.WORKER)
             try:
-                consumer._worker._ensure_consumer_pool(
-                    torch.device("cpu"), allow_host=True
+                consumer._worker._consumer_memory.prepare(
+                    torch.device("cpu"), receiving_rank=True, allow_host=True
                 )
-                pool = consumer._worker._consumer_pool
-                allocator = consumer._worker._consumer_pool_allocator
-                assert pool is not None and allocator is not None
-                offset, size = allocator.allocate(spec.nbytes)
-                tensor = (
-                    pool.narrow(0, offset, spec.nbytes).view(torch.float32).view(4, 4)
+                allocation = consumer._worker._consumer_memory.try_allocate(
+                    spec.nbytes, spec.shape, torch.float32
                 )
-                allocation = _ConsumerPoolAllocation(offset, size, tensor)
-                consumer._worker._consumer_residents.insert("hash", allocation, size)
-                consumer._worker._consumer_residents.retire("hash")
+                assert allocation is not None
+                tensor = allocation.tensor
+                consumer._worker._consumer_memory.publish("hash", allocation)
+                retire_event = MagicMock()
+                retire_event.query.return_value = True
+                with (
+                    patch.object(memory.torch, "Event", return_value=retire_event),
+                    patch.object(memory.torch.accelerator, "current_stream"),
+                ):
+                    consumer._worker._consumer_memory.retire_stale({}, set())
 
                 # A later push reserves the retired copy instead of transferring.
                 consumer._worker._reserve_push_destination(
@@ -2559,9 +2855,68 @@ class TestECMooncakeWorkerTransfer:
                         "dtype": spec.dtype,
                     }
                 )
-                assert consumer._worker._consumer_residents.num_evictable == 0
+                assert consumer._worker._consumer_memory.stats()[2] == 0
 
-                assert consumer._worker._take_resident_tensor(spec) is tensor
+                assert (
+                    consumer._worker._consumer_memory.take_resident(
+                        spec.mm_hash, spec.shape, spec.dtype
+                    )
+                    is tensor
+                )
+            finally:
+                consumer.shutdown()
+
+    def test_cached_take_uses_newer_same_hash_canonical(
+        self, mock_vllm_config_consumer
+    ):
+        config = mock_vllm_config_consumer
+        config.ec_transfer_config.ec_buffer_device = "cpu"
+        config.ec_transfer_config.ec_buffer_size = 768
+        config.ec_transfer_config.ec_connector_extra_config[
+            "consumer_buffer_pool_size"
+        ] = 768
+        shape = (16,)
+
+        with patch_ec_mooncake_deps():
+            consumer = ECMooncakeConnector(config, ECConnectorRole.WORKER)
+            worker = consumer._worker
+            memory_pool = worker._consumer_memory
+            try:
+                memory_pool.prepare(
+                    torch.device("cpu"), receiving_rank=True, allow_host=True
+                )
+                first = memory_pool.try_allocate(64, shape, torch.float32)
+                replacement = memory_pool.try_allocate(64, shape, torch.float32)
+                assert first is not None and replacement is not None
+                memory_pool.publish("hash", first)
+                worker._reserve_push_destination(
+                    {
+                        "transfer_id": "cached",
+                        "mm_hash": "hash",
+                        "nbytes": 64,
+                        "shape": list(shape),
+                        "dtype": "float32",
+                    }
+                )
+                memory_pool.publish("hash", replacement)
+                memory_pool.retire_stale({}, {"hash"})
+                spec = ECMooncakeLoadSpec(
+                    mm_hash="hash",
+                    num_token=1,
+                    nbytes=64,
+                    shape=shape,
+                    dtype="float32",
+                    pushed=True,
+                    transfer_id="cached",
+                )
+
+                tensor, allocation = worker._take_pushed_tensor(spec)
+
+                assert allocation is replacement
+                assert tensor is replacement.tensor
+                reused = memory_pool.try_allocate(64, shape, torch.float32)
+                assert reused is not None
+                assert reused.offset == first.offset
             finally:
                 consumer.shutdown()
 
@@ -2674,7 +3029,7 @@ class TestECMooncakeWorkerTransfer:
                 assert isinstance(engine, CopyingFakeTransferEngine)
                 # The staging pool is registered once; a transfer registers
                 # nothing of its own.
-                pool = producer._worker._producer_pool
+                pool = producer._worker._producer_memory.tensor
                 assert pool is not None
                 assert engine.register_calls == [[pool.data_ptr()]]
                 assert engine.batch_unregister_calls == []
@@ -2713,14 +3068,14 @@ class TestECMooncakeWorkerTransfer:
             try:
                 with patch(
                     "vllm.distributed.ec_transfer.ec_connector."
-                    "mooncake.worker.torch.empty",
+                    "mooncake.memory.torch.empty",
                     side_effect=torch.OutOfMemoryError,
                 ):
                     producer.start_save_caches(encoder_cache={"hash": source})
                     _wait_for_worker_io(producer)
                 engine = producer._worker._transfer._engine
                 assert isinstance(engine, CopyingFakeTransferEngine)
-                assert producer._worker._producer_pool is None
+                assert producer._worker._producer_memory.tensor is None
                 assert engine.register_calls == [[source.data_ptr()]]
                 assert engine.batch_unregister_calls == [[source.data_ptr()]]
                 assert engine.transfer_calls == [[source.nbytes]]
@@ -2863,8 +3218,8 @@ class TestECMooncakeWorkerTransfer:
                 mock_vllm_config_consumer, ECConnectorRole.WORKER
             )
             try:
-                consumer._worker._ensure_consumer_pool(
-                    torch.device("cpu"), allow_host=True
+                consumer._worker._consumer_memory.prepare(
+                    torch.device("cpu"), receiving_rank=True, allow_host=True
                 )
                 reservation = consumer._worker._reserve_push_destination(
                     {
@@ -2908,8 +3263,8 @@ class TestECMooncakeWorkerTransfer:
                 mock_vllm_config_consumer, ECConnectorRole.WORKER
             )
             try:
-                consumer._worker._ensure_consumer_pool(
-                    torch.device("cpu"), allow_host=True
+                consumer._worker._consumer_memory.prepare(
+                    torch.device("cpu"), receiving_rank=True, allow_host=True
                 )
                 first = consumer._worker._reserve_push_destination(payload("first"))
                 second = consumer._worker._reserve_push_destination(payload("second"))
@@ -2948,8 +3303,8 @@ class TestECMooncakeWorkerTransfer:
                 mock_vllm_config_consumer, ECConnectorRole.WORKER
             )
             try:
-                consumer._worker._ensure_consumer_pool(
-                    torch.device("cpu"), allow_host=True
+                consumer._worker._consumer_memory.prepare(
+                    torch.device("cpu"), receiving_rank=True, allow_host=True
                 )
                 old = consumer._worker._reserve_push_destination(payload)
                 consumer._worker._push_reservations["transfer"].expires_at = 0
@@ -2977,8 +3332,8 @@ class TestECMooncakeWorkerTransfer:
                 mock_vllm_config_consumer, ECConnectorRole.WORKER
             )
             try:
-                consumer._worker._ensure_consumer_pool(
-                    torch.device("cpu"), allow_host=True
+                consumer._worker._consumer_memory.prepare(
+                    torch.device("cpu"), receiving_rank=True, allow_host=True
                 )
                 reservation = consumer._worker._reserve_push_destination(
                     {
@@ -3020,8 +3375,8 @@ class TestECMooncakeWorkerTransfer:
                 mock_vllm_config_consumer, ECConnectorRole.WORKER
             )
             try:
-                consumer._worker._ensure_consumer_pool(
-                    torch.device("cpu"), allow_host=True
+                consumer._worker._consumer_memory.prepare(
+                    torch.device("cpu"), receiving_rank=True, allow_host=True
                 )
                 assert consumer._worker._cancel_push("cancelled-transfer", "")
                 cancelled = consumer._worker._reserve_push_destination(payload)
@@ -3055,8 +3410,8 @@ class TestECMooncakeWorkerTransfer:
                 mock_vllm_config_consumer, ECConnectorRole.WORKER
             )
             try:
-                consumer._worker._ensure_consumer_pool(
-                    torch.device("cpu"), allow_host=True
+                consumer._worker._consumer_memory.prepare(
+                    torch.device("cpu"), receiving_rank=True, allow_host=True
                 )
                 assert consumer._worker._cancel_push("refreshed-transfer", "")
                 assert consumer._worker._cancel_push("stale-transfer", "")
