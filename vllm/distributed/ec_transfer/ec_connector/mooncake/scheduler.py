@@ -4,16 +4,14 @@
 from __future__ import annotations
 
 import math
-import threading
 import time
 from collections import Counter, OrderedDict, deque
-from collections.abc import Callable, Collection
+from collections.abc import Collection
 from concurrent.futures import Future, ThreadPoolExecutor
 from contextlib import suppress
 from typing import TYPE_CHECKING, Any
 
 import torch
-import zmq
 
 from vllm.distributed.ec_transfer.ec_connector.base import (
     ECConnectorMetadata,
@@ -26,6 +24,11 @@ from vllm.distributed.ec_transfer.ec_connector.mooncake._availability import (
     ensure_mooncake_available,
 )
 from vllm.distributed.ec_transfer.ec_connector.mooncake.config import MooncakeECConfig
+from vllm.distributed.ec_transfer.ec_connector.mooncake.control import (
+    ControlClient,
+    EventInbox,
+    ShardTopology,
+)
 from vllm.distributed.ec_transfer.ec_connector.mooncake.metadata import (
     ECMooncakeConnectorMetadata,
     ECMooncakeLoadSpec,
@@ -47,51 +50,6 @@ _MAX_PENDING_EVENTS = 4096
 _MAX_CANCELLED_TRANSFER_IDS = 1 << 16
 
 
-class _SchedulerControlChannel:
-    """Reusable per-thread REQ sockets for scheduler control requests."""
-
-    def __init__(self, timeout_ms: int) -> None:
-        self._context = zmq.Context()
-        self._timeout_ms = timeout_ms
-        self._local = threading.local()
-
-    def _sockets(self) -> dict[str, zmq.Socket]:
-        sockets = getattr(self._local, "sockets", None)
-        if sockets is None:
-            sockets = {}
-            self._local.sockets = sockets
-        return sockets
-
-    def _discard(self, addr: str) -> None:
-        socket = self._sockets().pop(addr, None)
-        if socket is not None:
-            socket.close(linger=0)
-
-    def request(self, addr: str, payload: dict[str, Any]) -> Any:
-        sockets = self._sockets()
-        socket = sockets.get(addr)
-        if socket is None:
-            socket = self._context.socket(zmq.REQ)
-            socket.setsockopt(zmq.RCVTIMEO, self._timeout_ms)
-            socket.setsockopt(zmq.SNDTIMEO, self._timeout_ms)
-            socket.setsockopt(zmq.LINGER, 0)
-            socket.connect(addr)
-            sockets[addr] = socket
-        try:
-            socket.send_json(payload)
-            response = socket.recv_json()
-        except Exception:
-            self._discard(addr)
-            raise
-        assert isinstance(response, dict)
-        if not response.get("ok"):
-            raise RuntimeError(response.get("error", "EC control request failed"))
-        return response.get("result")
-
-    def close(self) -> None:
-        self._context.destroy(linger=0)
-
-
 class ECMooncakeScheduler:
     @classmethod
     def from_vllm_config(cls, vllm_config: VllmConfig) -> ECMooncakeScheduler:
@@ -100,16 +58,13 @@ class ECMooncakeScheduler:
             vllm_config, ECConnectorRole.SCHEDULER
         )
 
-        control_channel = _SchedulerControlChannel(config.control_timeout_ms)
+        control_client = ControlClient(config.control_timeout_ms)
+        topology = ShardTopology(control_client)
+        event_inbox = EventInbox(control_client, topology)
         control_executor = ThreadPoolExecutor(
             max_workers=config.control_workers,
             thread_name_prefix="ec-mooncake-control",
         )
-
-        def close_control() -> None:
-            control_executor.shutdown(wait=True, cancel_futures=True)
-            control_channel.close()
-
         encoder_cache_hidden_dim = (
             _get_encoder_cache_hidden_dim(vllm_config) if config.is_producer else None
         )
@@ -117,9 +72,10 @@ class ECMooncakeScheduler:
             config,
             encoder_cache_hidden_dim,
             model_config=vllm_config.model_config,
-            control_request=control_channel.request,
-            submit_control=control_executor.submit,
-            close_control=close_control,
+            control_client=control_client,
+            topology=topology,
+            event_inbox=event_inbox,
+            control_executor=control_executor,
         )
 
     def __init__(
@@ -127,9 +83,10 @@ class ECMooncakeScheduler:
         config: MooncakeECConfig,
         encoder_cache_hidden_dim: int | None,
         model_config: ModelConfig,
-        control_request: Callable[[str, dict[str, Any]], Any],
-        submit_control: Callable[..., Future[Any]],
-        close_control: Callable[[], None],
+        control_client: ControlClient,
+        topology: ShardTopology,
+        event_inbox: EventInbox,
+        control_executor: ThreadPoolExecutor,
     ) -> None:
         self._is_producer = config.is_producer
         self._is_consumer = config.is_consumer
@@ -139,9 +96,10 @@ class ECMooncakeScheduler:
         self._consumer_metrics_log_interval = config.consumer_metrics_log_interval
         self._encoder_cache_hidden_dim = encoder_cache_hidden_dim
         self._model_config = model_config
-        self._control_request = control_request
-        self._submit_control = submit_control
-        self._close_control = close_control
+        self._control_client = control_client
+        self._topology = topology
+        self._event_inbox = event_inbox
+        self._control_executor = control_executor
 
         self._metadata_fields_cache: dict[str, set[str]] = {}
         self._consumer_metrics_started_at = time.monotonic()
@@ -167,43 +125,15 @@ class ECMooncakeScheduler:
         self._scheduler_pending_work = False
         self._pushes_to_prepare: dict[str, ECMooncakePushSpec] = {}
         self._prepared_push_transfer_ids: set[str] = set()
-        self._consumer_shard_cache: dict[str, list[str]] = {}
-        self._event_zmq_ctx: zmq.Context | None = None
-        self._event_zmq_socket: zmq.Socket | None = None
         self._event_shard_count = 1
         self._event_ready_shards: OrderedDict[str, set[int]] = OrderedDict()
-
-    def _consumer_shards(self, base_addr: str) -> list[str]:
-        cached = self._consumer_shard_cache.get(base_addr)
-        if cached is not None:
-            return cached
-        shards = [base_addr]
-        try:
-            reply = self._control_request(base_addr, {"op": "peers"})
-            ports = reply.get("ports") if isinstance(reply, dict) else None
-            if ports:
-                prefix = base_addr.rsplit(":", 1)[0]
-                shards = [f"{prefix}:{int(port)}" for port in ports]
-        except Exception:
-            logger.warning(
-                "EC Mooncake consumer at %s did not report its shards; "
-                "assuming it is unsharded.",
-                base_addr,
-                exc_info=True,
-            )
-        self._consumer_shard_cache[base_addr] = shards
-        if len(shards) > 1:
-            logger.info(
-                "EC Mooncake consumer at %s has %d shards", base_addr, len(shards)
-            )
-        return shards
 
     def _cancel_remote(
         self, consumer_zmq: str, transfer_id: str, reservation_id: str
     ) -> bool:
         cancelled = False
-        for addr in self._consumer_shards(consumer_zmq):
-            result = self._control_request(
+        for addr in self._topology.shards(consumer_zmq):
+            result = self._control_client.request(
                 addr,
                 {
                     "op": "cancel",
@@ -244,7 +174,7 @@ class ECMooncakeScheduler:
         reservation: Any = "unknown"
         if transfer_id and self._reservation_zmq_addr is not None:
             try:
-                reservation = self._control_request(
+                reservation = self._control_client.request(
                     self._reservation_zmq_addr,
                     {"op": "status", "transfer_id": transfer_id},
                 )
@@ -455,7 +385,7 @@ class ECMooncakeScheduler:
         self._cancelled_transfer_ids[transfer_id] = (
             time.monotonic() + _LEASE_TTL_SECONDS
         )
-        self._pending_cancels[transfer_id] = self._submit_control(
+        self._pending_cancels[transfer_id] = self._control_executor.submit(
             self._cancel_remote,
             self._reservation_zmq_addr,
             transfer_id,
@@ -473,36 +403,6 @@ class ECMooncakeScheduler:
                 self._consumer_scheduler_metrics["pending_specs_expired"] += 1
                 self._queue_cancel(transfer_id)
 
-    def _ensure_event_channel(self) -> None:
-        if self._event_zmq_socket is not None:
-            return
-        assert self._reservation_zmq_addr is not None
-        shards = self._consumer_shards(self._reservation_zmq_addr)
-        ctx = zmq.Context()
-        socket = ctx.socket(zmq.PULL)
-        connected = 0
-        for addr in shards:
-            try:
-                event_port = self._control_request(addr, {"op": "event_port"})
-                address, _ = addr.rsplit(":", 1)
-                socket.connect(f"{address}:{int(event_port)}")
-            except Exception:
-                logger.warning(
-                    "EC Mooncake could not subscribe to the event channel of "
-                    "consumer shard %s; its readiness will only be seen "
-                    "through reserve replies.",
-                    addr,
-                )
-                continue
-            connected += 1
-        if not connected:
-            socket.close(linger=0)
-            ctx.term()
-            return
-        self._event_zmq_ctx = ctx
-        self._event_zmq_socket = socket
-        self._event_shard_count = connected
-
     def _drain_push_notifications(self) -> None:
         now = time.monotonic()
         if not self._drain_pending and now - self._drained_at < _DRAIN_MIN_INTERVAL:
@@ -514,16 +414,11 @@ class ECMooncakeScheduler:
         self._consumer_scheduler_metrics["cancel_records_dropped"] += (
             self._expire_cancel_records(self._cancelled_transfer_ids, now)
         )
-        if self._reservation_zmq_addr is not None:
-            self._ensure_event_channel()
-        socket = self._event_zmq_socket
-        if socket is None:
+        if self._reservation_zmq_addr is None:
             return
-        while True:
-            try:
-                data = socket.recv_json(flags=zmq.DONTWAIT)
-            except zmq.Again:
-                return
+        events = self._event_inbox.drain(self._reservation_zmq_addr)
+        self._event_shard_count = self._event_inbox.shard_count
+        for data in events:
             identifier = str(data["mm_hash"])
             self._consumer_scheduler_metrics["events_received"] += 1
             if data.get("ready"):
@@ -814,8 +709,6 @@ class ECMooncakeScheduler:
         return False, {"ec_items": items}
 
     def close(self) -> None:
-        self._close_control()
-        if self._event_zmq_socket is not None:
-            self._event_zmq_socket.close(linger=0)
-        if self._event_zmq_ctx is not None:
-            self._event_zmq_ctx.term()
+        self._control_executor.shutdown(wait=True, cancel_futures=True)
+        self._control_client.close()
+        self._event_inbox.close()

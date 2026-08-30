@@ -23,13 +23,18 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Generic, TypeVar
 
 import torch
-import zmq
 
 from vllm.distributed.ec_transfer.ec_connector.base import ECConnectorRole
 from vllm.distributed.ec_transfer.ec_connector.mooncake._availability import (
     ensure_mooncake_available,
 )
 from vllm.distributed.ec_transfer.ec_connector.mooncake.config import MooncakeECConfig
+from vllm.distributed.ec_transfer.ec_connector.mooncake.control import (
+    ConsumerControlServer,
+    ControlClient,
+    ControlCompletion,
+    ShardTopology,
+)
 from vllm.distributed.ec_transfer.ec_connector.mooncake.metadata import (
     ECMooncakeConnectorMetadata,
     ECMooncakeLoadSpec,
@@ -48,11 +53,6 @@ _T = TypeVar("_T")
 
 _LEASE_TTL_SECONDS = 300
 _RESERVATION_REFRESH_SECONDS = _LEASE_TTL_SECONDS / 2
-_RESERVATION_REAP_INTERVAL_SECONDS = 1
-# Readiness notifications are advisory: the scheduler also learns from the
-# reserve reply. Cap the queue so a shard nobody subscribed to cannot grow
-# without bound.
-_MAX_PENDING_EVENTS = 4096
 # A cancelled transfer stays on the scheduler's ignore list for as long as the
 # worker refuses to reserve it again. The count is a backstop for a rate that
 # outruns that TTL; the race it guards is a single drain interval wide.
@@ -92,12 +92,6 @@ class _PushReservation:
     expires_at: float = 0
 
 
-@dataclass(frozen=True)
-class _PushCompletion:
-    accepted: bool
-    became_ready: bool = False
-
-
 @dataclass
 class _PendingPush:
     tensor: torch.Tensor
@@ -117,63 +111,6 @@ class _PushPerfWindow:
     failures: int = 0
     stage_totals_ms: dict[str, float] = field(default_factory=dict)
     stage_max_ms: dict[str, float] = field(default_factory=dict)
-
-
-class _ControlChannel:
-    """Reusable REQ sockets for the ZMQ control plane.
-
-    One context and one connection per message costs a thread spawn plus a
-    TCP handshake, and the push path sends one message per reserve, complete
-    and cancel. Sockets are cached per thread because a REQ socket is neither
-    thread-safe nor usable after a failed exchange.
-    """
-
-    def __init__(self, timeout_ms: int):
-        self._context = zmq.Context()
-        self._timeout_ms = timeout_ms
-        self._local = threading.local()
-
-    def _sockets(self) -> dict[str, zmq.Socket]:
-        sockets = getattr(self._local, "sockets", None)
-        if sockets is None:
-            sockets = {}
-            self._local.sockets = sockets
-        return sockets
-
-    def _discard(self, addr: str) -> None:
-        socket = self._sockets().pop(addr, None)
-        if socket is not None:
-            socket.close(linger=0)
-
-    def send(self, addr: str, payload: dict[str, Any]) -> dict[str, Any]:
-        sockets = self._sockets()
-        socket = sockets.get(addr)
-        if socket is None:
-            socket = self._context.socket(zmq.REQ)
-            socket.setsockopt(zmq.RCVTIMEO, self._timeout_ms)
-            socket.setsockopt(zmq.SNDTIMEO, self._timeout_ms)
-            socket.setsockopt(zmq.LINGER, 0)
-            socket.connect(addr)
-            sockets[addr] = socket
-        try:
-            socket.send_json(payload)
-            response = socket.recv_json()
-        except Exception:
-            # A REQ socket cannot recover from a half-finished exchange.
-            self._discard(addr)
-            raise
-        assert isinstance(response, dict)
-        return response
-
-    def request(self, addr: str, payload: dict[str, Any]) -> Any:
-        response = self.send(addr, payload)
-        if not response.get("ok"):
-            raise RuntimeError(response.get("error", "EC control request failed"))
-        return response.get("result")
-
-    def close(self) -> None:
-        # Callers must have stopped every thread that used this channel.
-        self._context.destroy(linger=0)
 
 
 class _ResidentPool(Generic[_T]):
@@ -337,210 +274,6 @@ class _ContiguousAllocator:
                 self._free.pop(index)
 
 
-class ECMooncakeControlServer:
-    """Expose consumer reservations over a lightweight ZMQ control channel."""
-
-    def __init__(
-        self,
-        host: str,
-        port: int,
-        reserve: Callable[[dict[str, Any]], dict[str, Any]],
-        status: Callable[[str], dict[str, Any] | None],
-        complete: Callable[[str, str], _PushCompletion],
-        cancel: Callable[[str, str, bool], bool],
-        reap: Callable[[], int],
-        metrics_log_interval: float = 10,
-        peer_ports: list[int] | None = None,
-        device: torch.device | None = None,
-    ):
-        self.host = host
-        self.port = port
-        self.peer_ports = peer_ports or [port]
-        self._device = device
-        self.event_port: int | None = None
-        self._reserve = reserve
-        self._status = status
-        self._complete = complete
-        self._cancel = cancel
-        self._reap = reap
-        self._metrics_log_interval = metrics_log_interval
-        self._stop = threading.Event()
-        self._started = threading.Event()
-        self._thread: threading.Thread | None = None
-        self._startup_error: Exception | None = None
-
-    def start(self) -> None:
-        def loop() -> None:
-            if self._device is not None and self._device.type == "cuda":
-                # Reserving can retire an entry, and the event that orders its
-                # reuse is created on the recording thread's device rather
-                # than the stream's. A thread starts on device 0, which under
-                # a shard-local CUDA_VISIBLE_DEVICES is a peer's GPU, so
-                # without this every shard but the first strands a primary
-                # context there. The event orders correctly either way; what
-                # it costs is a few hundred MiB on someone else's card.
-                torch.accelerator.set_device_index(self._device.index or 0)
-            context = zmq.Context()
-            socket = context.socket(zmq.REP)
-            event_socket = context.socket(zmq.PUSH)
-            pending_events: deque[dict[str, Any]] = deque()
-            metrics: Counter[str] = Counter()
-
-            def queue_event(event: dict[str, Any]) -> None:
-                # The shard tag lets the scheduler tell each rank's readiness
-                # apart; a transfer is only loadable once every rank has it.
-                event["shard"] = self.port
-                if len(pending_events) >= _MAX_PENDING_EVENTS:
-                    pending_events.popleft()
-                    metrics["events_dropped"] += 1
-                pending_events.append(event)
-                metrics["events_queued"] += 1
-
-            metrics_started_at = time.monotonic()
-            last_reap_at = metrics_started_at
-            socket.setsockopt(zmq.RCVTIMEO, 100)
-            try:
-                socket.bind(f"tcp://{self.host}:{self.port}")
-                self.event_port = event_socket.bind_to_random_port(f"tcp://{self.host}")
-            except Exception as e:
-                self._startup_error = e
-                self._started.set()
-                socket.close(linger=0)
-                event_socket.close(linger=0)
-                context.term()
-                return
-            self._started.set()
-            try:
-                while not self._stop.is_set():
-                    while pending_events:
-                        try:
-                            event_socket.send_json(
-                                pending_events[0], flags=zmq.DONTWAIT
-                            )
-                        except zmq.Again:
-                            break
-                        pending_events.popleft()
-                        metrics["events_sent"] += 1
-                    now = time.monotonic()
-                    if now - last_reap_at >= _RESERVATION_REAP_INTERVAL_SECONDS:
-                        metrics["reservations_reaped"] += self._reap()
-                        last_reap_at = now
-                    if (
-                        self._metrics_log_interval > 0
-                        and now - metrics_started_at >= self._metrics_log_interval
-                    ):
-                        logger.info(
-                            "EC Mooncake consumer control: requests=%s, "
-                            "events_queued=%d, events_sent=%d, events_dropped=%d, "
-                            "event_backlog=%d, reservations_reaped=%d",
-                            {
-                                key.removeprefix("request_"): value
-                                for key, value in metrics.items()
-                                if key.startswith("request_")
-                            },
-                            metrics["events_queued"],
-                            metrics["events_sent"],
-                            metrics["events_dropped"],
-                            len(pending_events),
-                            metrics["reservations_reaped"],
-                        )
-                        metrics.clear()
-                        metrics_started_at = now
-                    try:
-                        request = socket.recv_json()
-                    except zmq.Again:
-                        continue
-                    try:
-                        op = request.get("op")
-                        result: Any = None
-                        metrics[f"request_{op}"] += 1
-                        if op == "reserve":
-                            result = self._reserve(request)
-                            if result.get("ready"):
-                                transfer_id = str(request["transfer_id"])
-                                status = self._status(transfer_id)
-                                if status is not None:
-                                    queue_event({"transfer_id": transfer_id, **status})
-                        elif op == "status":
-                            result = self._status(str(request["transfer_id"]))
-                        elif op == "event_port":
-                            result = self.event_port
-                        elif op == "peers":
-                            # Every consumer shard receives its own copy, so a
-                            # producer holding one address needs the rest.
-                            result = {"ports": self.peer_ports}
-                        elif op in ("complete", "complete_batch"):
-                            items = (
-                                request["items"]
-                                if op == "complete_batch"
-                                else [request]
-                            )
-                            completions = []
-                            for item in items:
-                                transfer_id = str(item["transfer_id"])
-                                completion = self._complete(
-                                    transfer_id,
-                                    str(item["reservation_id"]),
-                                )
-                                completions.append(
-                                    {
-                                        "completed": completion.accepted,
-                                        "became_ready": completion.became_ready,
-                                    }
-                                )
-                                if not completion.became_ready:
-                                    continue
-                                status = self._status(transfer_id)
-                                if status is not None:
-                                    queue_event({"transfer_id": transfer_id, **status})
-                            result = (
-                                {"items": completions}
-                                if op == "complete_batch"
-                                else completions[0]
-                            )
-                        elif op == "cancel":
-                            result = {
-                                "cancelled": self._cancel(
-                                    str(request["transfer_id"]),
-                                    str(request.get("reservation_id", "")),
-                                    bool(request.get("abandon", False)),
-                                )
-                            }
-                        else:
-                            raise ValueError(f"unknown control op: {op!r}")
-                        socket.send_json({"ok": True, "result": result})
-                    except Exception as e:
-                        socket.send_json({"ok": False, "error": str(e)})
-            finally:
-                socket.close(linger=0)
-                event_socket.close(linger=0)
-                context.term()
-
-        self._thread = threading.Thread(
-            target=loop, name="ec-mooncake-control", daemon=True
-        )
-        self._thread.start()
-        if not self._started.wait(timeout=5):
-            raise RuntimeError("EC Mooncake control channel failed to start")
-        if self._startup_error is not None:
-            raise RuntimeError("EC Mooncake control channel failed to bind") from (
-                self._startup_error
-            )
-        logger.info(
-            "EC Mooncake control channel listening on tcp://%s:%d (events tcp://%s:%d)",
-            self.host,
-            self.port,
-            self.host,
-            self.event_port,
-        )
-
-    def shutdown(self) -> None:
-        if self._thread is None:
-            return
-        self._stop.set()
-        self._thread.join()
-
-
 class ECMooncakeWorker:
     """
     EC connector using Mooncake TransferEngine for GPU tensor transport.
@@ -597,11 +330,27 @@ class ECMooncakeWorker:
     @classmethod
     def from_vllm_config(cls, vllm_config: VllmConfig) -> ECMooncakeWorker:
         ensure_mooncake_available()
-        return cls(
-            MooncakeECConfig.from_vllm_config(vllm_config, ECConnectorRole.WORKER)
-        )
+        config = MooncakeECConfig.from_vllm_config(vllm_config, ECConnectorRole.WORKER)
+        hostname = get_ip()
+        control_client = ControlClient(config.control_timeout_ms)
+        try:
+            return cls(
+                config,
+                hostname,
+                control_client,
+                ShardTopology(control_client),
+            )
+        except Exception:
+            control_client.close()
+            raise
 
-    def __init__(self, config: MooncakeECConfig):
+    def __init__(
+        self,
+        config: MooncakeECConfig,
+        hostname: str,
+        control_client: ControlClient,
+        topology: ShardTopology,
+    ) -> None:
         self.is_producer = config.is_producer
         self.is_consumer = config.is_consumer
         self._protocol = config.protocol
@@ -629,7 +378,7 @@ class ECMooncakeWorker:
         self._consumer_lock = threading.Lock()
         self._push_reservations: dict[str, _PushReservation] = {}
         self._cancelled_transfers: OrderedDict[str, float] = OrderedDict()
-        self._control_server: ECMooncakeControlServer | None = None
+        self._control_server: ConsumerControlServer | None = None
         self._consumer_metrics_log_interval = config.consumer_metrics_log_interval
         self._consumer_metrics_started_at = time.monotonic()
         self._consumer_worker_metrics: Counter[str] = Counter()
@@ -639,7 +388,7 @@ class ECMooncakeWorker:
         # Worker producer
         self._engine: TransferEngine | None = None
         self._engine_lock = threading.Lock()
-        self._hostname = get_ip()
+        self._hostname = hostname
         # Published encoder outputs, referenced while a pull is reading them.
         self._pending_unregister: dict[int, torch.Tensor] = {}
         self._push_source_registrations: dict[int, _PushSourceRegistration] = {}
@@ -650,7 +399,8 @@ class ECMooncakeWorker:
         self._producer_pool_disabled = False
         self._producer_pool_lock = threading.Lock()
         self._transfer_metrics_log_interval = config.transfer_metrics_log_interval
-        self._control_channel = _ControlChannel(config.control_timeout_ms)
+        self._control_client = control_client
+        self._topology = topology
         self._producer_metrics: Counter[str] = Counter()
         self._io_executor = ThreadPoolExecutor(
             max_workers=config.transfer_workers,
@@ -660,7 +410,6 @@ class ECMooncakeWorker:
             max_workers=config.control_workers,
             thread_name_prefix="ec-mooncake-control",
         )
-        self._consumer_shard_cache: dict[str, list[str]] = {}
         self._shard_pool: ThreadPoolExecutor | None = None
         self._shard_pool_lock = threading.Lock()
         self._pending_saves: list[tuple[str, Future[None]]] = []
@@ -742,7 +491,7 @@ class ECMooncakeWorker:
                 "Mooncake push mode requires a registered consumer buffer pool."
             )
         base_port = self._reservation_zmq_port
-        self._control_server = ECMooncakeControlServer(
+        self._control_server = ConsumerControlServer(
             "0.0.0.0",
             base_port + self._tp_rank,
             self._reserve_push_destination,
@@ -754,7 +503,12 @@ class ECMooncakeWorker:
             peer_ports=[base_port + rank for rank in range(self._tp_size)],
             device=self._consumer_pool.device,
         )
-        self._control_server.start()
+        try:
+            self._control_server.start()
+        except Exception:
+            self._control_server.close()
+            self._control_server = None
+            raise
 
     def _unregister_memory(self, tensor: torch.Tensor) -> bool:
         assert self._engine is not None
@@ -1289,15 +1043,17 @@ class ECMooncakeWorker:
                 "dtype": reservation.dtype,
             }
 
-    def _complete_push(self, transfer_id: str, reservation_id: str) -> _PushCompletion:
+    def _complete_push(
+        self, transfer_id: str, reservation_id: str
+    ) -> ControlCompletion:
         with self._consumer_lock:
             reservation = self._push_reservations.get(transfer_id)
             if reservation is None or reservation.reservation_id != reservation_id:
                 self._consumer_worker_metrics["completions_rejected"] += 1
-                return _PushCompletion(False)
+                return ControlCompletion(False)
             if reservation.ready:
                 self._consumer_worker_metrics["completions_repeated"] += 1
-                return _PushCompletion(True)
+                return ControlCompletion(True)
             self._consumer_worker_metrics["completions_accepted"] += 1
             if reservation.discard_on_complete:
                 allocator = self._consumer_pool_allocator
@@ -1308,10 +1064,10 @@ class ECMooncakeWorker:
                         reservation.allocation.offset, reservation.allocation.size
                     )
                 self._consumer_worker_metrics["reservations_discarded"] += 1
-                return _PushCompletion(True)
+                return ControlCompletion(True)
             reservation.ready = True
             reservation.expires_at = time.monotonic() + _LEASE_TTL_SECONDS
-            return _PushCompletion(True, became_ready=True)
+            return ControlCompletion(True, became_ready=True)
 
     def _cancel_push(
         self, transfer_id: str, reservation_id: str, abandon: bool = False
@@ -1384,41 +1140,8 @@ class ECMooncakeWorker:
                 )
             return self._shard_pool
 
-    def _consumer_shards(self, base_addr: str) -> list[str]:
-        """Every control channel of the consumer reachable at `base_addr`.
-
-        A tensor-parallel consumer gathers from each rank's own cache, so each
-        rank receives its own copy. Asking the first one for the roster keeps
-        the address list out of the request and the proxy configuration.
-        """
-        cached = self._consumer_shard_cache.get(base_addr)
-        if cached is not None:
-            return cached
-        shards = [base_addr]
-        try:
-            reply = self._control_channel.request(base_addr, {"op": "peers"})
-            ports = reply.get("ports") if isinstance(reply, dict) else None
-            if ports:
-                prefix = base_addr.rsplit(":", 1)[0]
-                shards = [f"{prefix}:{int(port)}" for port in ports]
-        except Exception:
-            # An older consumer does not answer this, and it can only be
-            # unsharded, so its single address is the whole roster.
-            logger.warning(
-                "EC Mooncake consumer at %s did not report its shards; "
-                "assuming it is unsharded.",
-                base_addr,
-                exc_info=True,
-            )
-        self._consumer_shard_cache[base_addr] = shards
-        if len(shards) > 1:
-            logger.info(
-                "EC Mooncake consumer at %s has %d shards", base_addr, len(shards)
-            )
-        return shards
-
     def _reserve_one(self, addr: str, spec: ECMooncakePushSpec) -> dict[str, Any]:
-        result = self._control_channel.request(
+        result = self._control_client.request(
             addr,
             {
                 "op": "reserve",
@@ -1437,7 +1160,7 @@ class ECMooncakeWorker:
 
     def _reserve_remote(self, spec: ECMooncakePushSpec) -> list[dict[str, Any]]:
         """Reserve a destination on every shard of the consumer."""
-        shards = self._consumer_shards(spec.consumer_zmq)
+        shards = self._topology.shards(spec.consumer_zmq)
         if len(shards) == 1:
             return [self._reserve_one(shards[0], spec)]
         # This already runs on the control pool, so the extra shards go to the
@@ -1458,8 +1181,8 @@ class ECMooncakeWorker:
         the first would leave the rest pinning pool slots until they expire.
         """
         cancelled = False
-        for addr in self._consumer_shards(consumer_zmq):
-            result = self._control_channel.request(
+        for addr in self._topology.shards(consumer_zmq):
+            result = self._control_client.request(
                 addr,
                 {
                     "op": "cancel",
@@ -1721,7 +1444,7 @@ class ECMooncakeWorker:
                 str(reservation.get("addr", push.spec.consumer_zmq)), []
             ).append((push, reservation))
         for consumer_zmq, items in by_destination.items():
-            result = self._control_channel.request(
+            result = self._control_client.request(
                 consumer_zmq,
                 {
                     "op": "complete_batch",
@@ -1754,7 +1477,7 @@ class ECMooncakeWorker:
                 shards = [{"addr": push.spec.consumer_zmq, "reservation_id": ""}]
             for shard in shards:
                 with suppress(Exception):
-                    self._control_channel.request(
+                    self._control_client.request(
                         str(shard.get("addr", push.spec.consumer_zmq)),
                         {
                             "op": "cancel",
@@ -1892,7 +1615,7 @@ class ECMooncakeWorker:
             for shard in reservation.result():
                 if shard.get("cached", False) or shard.get("cancelled", False):
                     continue
-                self._control_channel.request(
+                self._control_client.request(
                     str(shard.get("addr", spec.consumer_zmq)),
                     {
                         "op": "cancel",
@@ -1995,9 +1718,9 @@ class ECMooncakeWorker:
             self._shard_pool.shutdown(wait=True, cancel_futures=True)
         self._control_executor.shutdown(wait=True, cancel_futures=True)
         # Every thread that could hold a control socket is stopped by now.
-        self._control_channel.close()
+        self._control_client.close()
         if self._control_server is not None:
-            self._control_server.shutdown()
+            self._control_server.close()
         if self._engine is not None:
             if self._consumer_pool is not None and self._unregister_memory(
                 self._consumer_pool

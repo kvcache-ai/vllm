@@ -9,12 +9,13 @@ import ctypes
 import importlib
 import socket
 import sys
+import threading
 import time
 from contextlib import contextmanager
 from dataclasses import FrozenInstanceError
 from multiprocessing.reduction import ForkingPickler
 from types import ModuleType, SimpleNamespace
-from unittest.mock import Mock, patch
+from unittest.mock import MagicMock, Mock, call, patch
 
 import pytest
 import torch
@@ -27,8 +28,15 @@ from vllm.distributed.ec_transfer.ec_connector.base import (
     ECConnectorRole,
 )
 from vllm.distributed.ec_transfer.ec_connector.factory import ECConnectorFactory
-from vllm.distributed.ec_transfer.ec_connector.mooncake import metadata
+from vllm.distributed.ec_transfer.ec_connector.mooncake import control, metadata
 from vllm.distributed.ec_transfer.ec_connector.mooncake.config import MooncakeECConfig
+from vllm.distributed.ec_transfer.ec_connector.mooncake.control import (
+    ConsumerControlServer,
+    ControlClient,
+    ControlCompletion,
+    EventInbox,
+    ShardTopology,
+)
 from vllm.distributed.ec_transfer.ec_connector.mooncake.scheduler import (
     ECMooncakeScheduler,
 )
@@ -124,6 +132,242 @@ def _wait_for_worker_io(
             return meta
         time.sleep(0.01)
     raise TimeoutError("EC Mooncake worker I/O did not finish")
+
+
+class TestECMooncakeControlPlane:
+    def test_worker_get_ip_failure_does_not_construct_client(
+        self, mock_vllm_config_producer
+    ):
+        with (
+            patch_ec_mooncake_deps(),
+            patch(
+                "vllm.distributed.ec_transfer.ec_connector.mooncake.worker.get_ip",
+                side_effect=RuntimeError("no address"),
+            ),
+            patch(
+                "vllm.distributed.ec_transfer.ec_connector.mooncake."
+                "worker.ControlClient"
+            ) as client_cls,
+            pytest.raises(RuntimeError, match="no address"),
+        ):
+            ECMooncakeConnector(mock_vllm_config_producer, ECConnectorRole.WORKER)
+
+        client_cls.assert_not_called()
+
+    def test_worker_constructor_failure_closes_client(self, mock_vllm_config_producer):
+        with (
+            patch_ec_mooncake_deps(),
+            patch(
+                "vllm.distributed.ec_transfer.ec_connector.mooncake."
+                "worker.ControlClient"
+            ) as client_cls,
+            patch(
+                "vllm.distributed.ec_transfer.ec_connector.mooncake."
+                "worker.ThreadPoolExecutor",
+                side_effect=RuntimeError("executor failed"),
+            ),
+            pytest.raises(RuntimeError, match="executor failed"),
+        ):
+            ECMooncakeConnector(mock_vllm_config_producer, ECConnectorRole.WORKER)
+
+        client_cls.return_value.close.assert_called_once_with()
+
+    def test_client_reuses_socket_and_discards_failed_exchange(self):
+        context = MagicMock()
+        socket = context.socket.return_value
+        socket.recv_json.side_effect = [
+            {"ok": True, "result": {"ports": [19019]}},
+            {"ok": True},
+            {"ok": False, "error": "reservation rejected"},
+            RuntimeError("timeout"),
+        ]
+
+        with patch.object(control.zmq, "Context", return_value=context):
+            client = ControlClient(17)
+            assert client.request("tcp://consumer:19019", {"op": "peers"}) == {
+                "ports": [19019]
+            }
+            assert client.request("tcp://consumer:19019", {"op": "event_port"}) is None
+            with pytest.raises(RuntimeError, match="reservation rejected"):
+                client.request(
+                    "tcp://consumer:19019",
+                    {"op": "status", "transfer_id": "transfer"},
+                )
+            with pytest.raises(RuntimeError, match="timeout"):
+                client.request("tcp://consumer:19019", {"op": "event_port"})
+            client.close()
+            client.close()
+
+        context.socket.assert_called_once_with(zmq.REQ)
+        assert socket.setsockopt.call_args_list == [
+            call(zmq.RCVTIMEO, 17),
+            call(zmq.SNDTIMEO, 17),
+            call(zmq.LINGER, 0),
+        ]
+        socket.connect.assert_called_once_with("tcp://consumer:19019")
+        socket.close.assert_called_once_with(linger=0)
+        context.destroy.assert_called_once_with(linger=0)
+
+    def test_client_uses_one_socket_per_thread(self):
+        context = MagicMock()
+        sockets = [MagicMock(), MagicMock()]
+        for index, control_socket in enumerate(sockets):
+            control_socket.recv_json.return_value = {"ok": True, "result": index}
+        context.socket.side_effect = sockets
+        barrier = threading.Barrier(2)
+        results: list[int] = []
+
+        with patch.object(control.zmq, "Context", return_value=context):
+            client = ControlClient(20)
+
+            def request() -> None:
+                barrier.wait()
+                results.append(client.request("tcp://consumer:19019", {"op": "peers"}))
+
+            threads = [threading.Thread(target=request) for _ in range(2)]
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join()
+            client.close()
+
+        assert sorted(results) == [0, 1]
+        assert context.socket.call_args_list == [call(zmq.REQ), call(zmq.REQ)]
+        for control_socket in sockets:
+            control_socket.connect.assert_called_once_with("tcp://consumer:19019")
+
+    def test_topology_caches_discovery_and_failure_fallback(self):
+        client = Mock(spec=ControlClient)
+        client.request.side_effect = [
+            {"ports": [19019, 19020]},
+            RuntimeError("old consumer"),
+        ]
+        topology = ShardTopology(client)
+
+        assert topology.shards("tcp://consumer:19019") == [
+            "tcp://consumer:19019",
+            "tcp://consumer:19020",
+        ]
+        assert topology.shards("tcp://consumer:19019") == [
+            "tcp://consumer:19019",
+            "tcp://consumer:19020",
+        ]
+        assert topology.shards("tcp://legacy:19019") == ["tcp://legacy:19019"]
+        assert client.request.call_args_list == [
+            call("tcp://consumer:19019", {"op": "peers"}),
+            call("tcp://legacy:19019", {"op": "peers"}),
+        ]
+
+    def test_event_inbox_drains_without_blocking_and_closes_once(self):
+        client = Mock(spec=ControlClient)
+        client.request.side_effect = [20001, RuntimeError("missing shard")]
+        topology = Mock(spec=ShardTopology)
+        topology.shards.return_value = [
+            "tcp://consumer:19019",
+            "tcp://consumer:19020",
+        ]
+        context = MagicMock()
+        socket = context.socket.return_value
+        event = {"transfer_id": "transfer", "ready": True}
+        socket.recv_json.side_effect = [event, zmq.Again()]
+
+        with patch.object(control.zmq, "Context", return_value=context):
+            inbox = EventInbox(client, topology)
+            assert inbox.drain("tcp://consumer:19019") == [event]
+            assert inbox.shard_count == 1
+            inbox.close()
+            inbox.close()
+
+        assert client.request.call_args_list == [
+            call("tcp://consumer:19019", {"op": "event_port"}),
+            call("tcp://consumer:19020", {"op": "event_port"}),
+        ]
+        socket.connect.assert_called_once_with("tcp://consumer:20001")
+        assert socket.recv_json.call_args_list == [
+            call(flags=zmq.DONTWAIT),
+            call(flags=zmq.DONTWAIT),
+        ]
+        socket.close.assert_called_once_with(linger=0)
+        context.term.assert_called_once_with()
+
+    def test_server_preserves_wire_shapes_and_closes_twice(self):
+        port = _find_free_port()
+        completed: list[tuple[str, str]] = []
+        cancelled: list[tuple[str, str, bool]] = []
+
+        def status(transfer_id: str):
+            return {"transfer_id": transfer_id, "ready": False}
+
+        def complete(transfer_id: str, reservation_id: str):
+            completed.append((transfer_id, reservation_id))
+            return ControlCompletion(True, became_ready=True)
+
+        def cancel(transfer_id: str, reservation_id: str, abandon: bool):
+            cancelled.append((transfer_id, reservation_id, abandon))
+            return True
+
+        server = ConsumerControlServer(
+            "127.0.0.1",
+            port,
+            reserve=lambda request: {"nbytes": request["nbytes"], "ready": False},
+            status=status,
+            complete=complete,
+            cancel=cancel,
+            reap=lambda: 0,
+            peer_ports=[port, port + 1],
+        )
+        client = ControlClient(1000)
+        server.start()
+        try:
+            addr = f"tcp://127.0.0.1:{port}"
+            assert client.request(addr, {"op": "peers"}) == {"ports": [port, port + 1]}
+            assert isinstance(client.request(addr, {"op": "event_port"}), int)
+            assert client.request(
+                addr, {"op": "status", "transfer_id": "transfer"}
+            ) == {"transfer_id": "transfer", "ready": False}
+            assert client.request(
+                addr,
+                {
+                    "op": "reserve",
+                    "transfer_id": "transfer",
+                    "mm_hash": "hash",
+                    "nbytes": 16,
+                    "shape": [4],
+                    "dtype": "float32",
+                },
+            ) == {"nbytes": 16, "ready": False}
+            assert client.request(
+                addr,
+                {
+                    "op": "complete",
+                    "transfer_id": "transfer",
+                    "reservation_id": "r0",
+                },
+            ) == {"completed": True, "became_ready": True}
+            assert client.request(
+                addr,
+                {
+                    "op": "complete_batch",
+                    "items": [{"transfer_id": "transfer", "reservation_id": "r0"}],
+                },
+            ) == {"items": [{"completed": True, "became_ready": True}]}
+            assert client.request(
+                addr,
+                {
+                    "op": "cancel",
+                    "transfer_id": "transfer",
+                    "reservation_id": "r0",
+                    "abandon": True,
+                },
+            ) == {"cancelled": True}
+        finally:
+            client.close()
+            client.close()
+            server.close()
+            server.close()
+
+        assert completed == [("transfer", "r0"), ("transfer", "r0")]
+        assert cancelled == [("transfer", "r0", True)]
 
 
 @pytest.fixture
@@ -490,12 +734,12 @@ class TestMooncakeECConfig:
             patch_ec_mooncake_deps(),
             patch(
                 "vllm.distributed.ec_transfer.ec_connector.mooncake."
-                "scheduler._SchedulerControlChannel"
-            ) as scheduler_channel,
+                "scheduler.ControlClient"
+            ) as scheduler_client,
             patch(
                 "vllm.distributed.ec_transfer.ec_connector.mooncake."
-                "worker._ControlChannel"
-            ) as worker_channel,
+                "worker.ControlClient"
+            ) as worker_client,
         ):
             scheduler = ECMooncakeConnector(
                 mock_vllm_config_producer, ECConnectorRole.SCHEDULER
@@ -506,8 +750,8 @@ class TestMooncakeECConfig:
             scheduler.shutdown()
             worker.shutdown()
 
-        scheduler_channel.assert_called_once_with(1)
-        worker_channel.assert_called_once_with(1)
+        scheduler_client.assert_called_once_with(1)
+        worker_client.assert_called_once_with(1)
 
     @pytest.mark.parametrize("timeout", [1e308, sys.float_info.max])
     def test_rejects_control_timeout_too_large_for_zmq(
@@ -1178,11 +1422,7 @@ class TestECMooncakeSchedulerMetadata:
             )
             try:
                 scheduler._scheduler._ready_hashes.add(mm_hash)
-                scheduler._scheduler._event_zmq_socket = Mock()
-                scheduler._scheduler._event_zmq_socket.recv_json.side_effect = [
-                    event,
-                    zmq.Again(),
-                ]
+                scheduler._scheduler._event_inbox.drain = Mock(return_value=[event])
                 with patch.object(scheduler._scheduler, "_queue_cancel") as cancel:
                     scheduler._scheduler._drain_push_notifications()
                 cancel.assert_not_called()
@@ -1222,14 +1462,13 @@ class TestECMooncakeSchedulerMetadata:
                 mock_vllm_config_consumer, ECConnectorRole.SCHEDULER
             )
             try:
-                scheduler._scheduler._event_shard_count = len(ports)
+                scheduler._scheduler._event_inbox.shard_count = len(ports)
                 scheduler._scheduler._cancelled_transfer_ids[transfer_id] = (
                     time.monotonic() + _LEASE_TTL_SECONDS
                 )
-                scheduler._scheduler._event_zmq_socket = Mock()
-                scheduler._scheduler._event_zmq_socket.recv_json.side_effect = [
-                    {**event, "shard": port} for port in ports
-                ] + [zmq.Again()]
+                scheduler._scheduler._event_inbox.drain = Mock(
+                    return_value=[{**event, "shard": port} for port in ports]
+                )
 
                 scheduler._scheduler._drain_push_notifications()
 
@@ -1269,9 +1508,9 @@ class TestECMooncakeSchedulerMetadata:
         }
 
         def deliver(scheduler, *shards):
-            scheduler._scheduler._event_zmq_socket.recv_json.side_effect = [
+            scheduler._scheduler._event_inbox.drain.return_value = [
                 {**event, "shard": shard} for shard in shards
-            ] + [zmq.Again()]
+            ]
             scheduler._scheduler._drain_pending = True
             scheduler._scheduler._drain_push_notifications()
 
@@ -1281,8 +1520,8 @@ class TestECMooncakeSchedulerMetadata:
             )
             try:
                 scheduler._scheduler._reservation_zmq_addr = "tcp://127.0.0.1:19101"
-                scheduler._scheduler._event_shard_count = 4
-                scheduler._scheduler._event_zmq_socket = Mock()
+                scheduler._scheduler._event_inbox.shard_count = 4
+                scheduler._scheduler._event_inbox.drain = Mock()
 
                 deliver(scheduler, 0, 1)
                 assert scheduler._scheduler._event_ready_shards[transfer_id] == {0, 1}
@@ -1318,10 +1557,7 @@ class TestECMooncakeSchedulerMetadata:
             )
             try:
                 scheduler._scheduler._reservation_zmq_addr = "tcp://127.0.0.1:19101"
-                scheduler._scheduler._event_zmq_socket = Mock()
-                scheduler._scheduler._event_zmq_socket.recv_json.side_effect = (
-                    zmq.Again()
-                )
+                scheduler._scheduler._event_inbox.drain = Mock(return_value=[])
                 with patch.object(
                     scheduler._scheduler, "_cancel_remote", return_value=True
                 ):
@@ -1388,7 +1624,9 @@ class TestECMooncakeSchedulerMetadata:
                 with (
                     patch.object(scheduler._scheduler, "_drain_push_notifications"),
                     patch.object(
-                        scheduler._scheduler, "_control_request", return_value=None
+                        scheduler._scheduler._control_client,
+                        "request",
+                        return_value=None,
                     ),
                     patch(
                         "vllm.distributed.ec_transfer.ec_connector."
@@ -1435,9 +1673,11 @@ class TestECMooncakeSchedulerMetadata:
                     f"tcp://127.0.0.1:{ports[0]}"
                 )
                 with patch.object(
-                    scheduler._scheduler, "_control_request", side_effect=fake_send
+                    scheduler._scheduler._control_client,
+                    "request",
+                    side_effect=fake_send,
                 ) as send_control:
-                    scheduler._scheduler._ensure_event_channel()
+                    scheduler._scheduler._drain_push_notifications()
 
                 subscribed = [
                     call.args[0]
@@ -1496,19 +1736,19 @@ class TestECMooncakeSchedulerMetadata:
                 mock_vllm_config_consumer, ECConnectorRole.SCHEDULER
             )
             try:
-                scheduler._scheduler._event_zmq_socket = Mock()
-                scheduler._scheduler._event_zmq_socket.recv_json.side_effect = [
-                    {
-                        "mm_hash": mm_hash,
-                        "transfer_id": "only-transfer",
-                        "ready": True,
-                        "reservation_id": "r0",
-                        "nbytes": 16,
-                        "shape": [4],
-                        "dtype": "float32",
-                    },
-                    zmq.Again(),
-                ]
+                scheduler._scheduler._event_inbox.drain = Mock(
+                    return_value=[
+                        {
+                            "mm_hash": mm_hash,
+                            "transfer_id": "only-transfer",
+                            "ready": True,
+                            "reservation_id": "r0",
+                            "nbytes": 16,
+                            "shape": [4],
+                            "dtype": "float32",
+                        }
+                    ]
+                )
                 scheduler._scheduler._drain_push_notifications()
 
                 assert not scheduler.ensure_cache_available(first, 0, set())
@@ -1607,11 +1847,7 @@ class TestECMooncakeSchedulerMetadata:
             scheduler = ECMooncakeConnector(
                 mock_vllm_config_consumer, ECConnectorRole.SCHEDULER
             )
-            scheduler._scheduler._event_zmq_socket = Mock()
-            scheduler._scheduler._event_zmq_socket.recv_json.side_effect = [
-                event,
-                zmq.Again(),
-            ]
+            scheduler._scheduler._event_inbox.drain = Mock(return_value=[event])
             scheduler._scheduler._loading_hashes.add("hash")
 
             scheduler._scheduler._drain_push_notifications()
@@ -1772,6 +2008,34 @@ class TestECMooncakeSchedulerMetadata:
 
 
 class TestECMooncakeWorkerTransfer:
+    def test_control_server_start_failure_closes_server(
+        self, mock_vllm_config_consumer
+    ):
+        mock_vllm_config_consumer.ec_transfer_config.ec_buffer_device = "cpu"
+        mock_vllm_config_consumer.ec_transfer_config.ec_buffer_size = 4096
+        mock_vllm_config_consumer.ec_transfer_config.ec_connector_extra_config[
+            "consumer_buffer_pool_size"
+        ] = 4096
+
+        with (
+            patch_ec_mooncake_deps(),
+            patch(
+                "vllm.distributed.ec_transfer.ec_connector.mooncake."
+                "worker.ConsumerControlServer"
+            ) as server_cls,
+        ):
+            server_cls.return_value.start.side_effect = RuntimeError("bind failed")
+            connector = ECMooncakeConnector(
+                mock_vllm_config_consumer, ECConnectorRole.WORKER
+            )
+            try:
+                with pytest.raises(RuntimeError, match="bind failed"):
+                    connector.start_worker_services()
+                server_cls.return_value.close.assert_called_once_with()
+                assert connector._worker._control_server is None
+            finally:
+                connector.shutdown()
+
     def test_batches_pushes_from_one_model_step(self, mock_vllm_config_producer):
         port = _find_free_port()
         consumer_cfg = Mock(spec=VllmConfig)
@@ -1877,9 +2141,9 @@ class TestECMooncakeWorkerTransfer:
                 reservation_data["_received_at"] -= _LEASE_TTL_SECONDS
                 consumer._worker._push_reservations["transfer-1"].expires_at = 0
                 with patch.object(
-                    scheduler._scheduler,
-                    "_control_request",
-                    wraps=scheduler._scheduler._control_request,
+                    scheduler._scheduler._control_client,
+                    "request",
+                    wraps=scheduler._scheduler._control_client.request,
                 ) as send_control:
                     assert not scheduler.has_cache_item("hash")
                     assert not scheduler.has_cache_item("hash")
@@ -2193,7 +2457,7 @@ class TestECMooncakeWorkerTransfer:
             producer.bind_connector_metadata(ECMooncakeConnectorMetadata(pushes=[spec]))
             try:
                 with patch.object(
-                    producer._worker._control_channel,
+                    producer._worker._control_client,
                     "request",
                     side_effect=fake_send,
                 ):
@@ -2380,9 +2644,9 @@ class TestECMooncakeWorkerTransfer:
             producer.bind_connector_metadata(ECMooncakeConnectorMetadata(pushes=pushes))
             try:
                 with patch.object(
-                    producer._worker._control_channel,
+                    producer._worker._control_client,
                     "request",
-                    wraps=producer._worker._control_channel.request,
+                    wraps=producer._worker._control_client.request,
                 ) as send_control:
                     producer.start_save_caches(encoder_cache=sources)
                     _wait_for_worker_io(producer)
