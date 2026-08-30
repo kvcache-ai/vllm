@@ -9,6 +9,7 @@ import ctypes
 import socket
 import time
 from contextlib import contextmanager
+from multiprocessing.reduction import ForkingPickler
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
@@ -19,6 +20,7 @@ import zmq
 from vllm.config import VllmConfig
 from vllm.distributed.ec_transfer.ec_connector.base import ECConnectorRole
 from vllm.distributed.ec_transfer.ec_connector.factory import ECConnectorFactory
+from vllm.distributed.ec_transfer.ec_connector.mooncake import metadata
 from vllm.distributed.ec_transfer.ec_connector.mooncake_ec_connector import (
     _LEASE_TTL_SECONDS,
     ECMooncakeConnector,
@@ -251,6 +253,55 @@ class TestECMooncakeConnectorValidation:
             pytest.raises(ValueError, match="data_parallel_size=1"),
         ):
             ECMooncakeConnector(mock_vllm_config_producer, ECConnectorRole.SCHEDULER)
+
+
+class TestECMooncakeMetadata:
+    def test_old_imports_reexport_packaged_metadata(self):
+        assert ECMooncakeLoadSpec is metadata.ECMooncakeLoadSpec
+        assert ECMooncakePushSpec is metadata.ECMooncakePushSpec
+        assert ECMooncakeConnectorMetadata is metadata.ECMooncakeConnectorMetadata
+        assert ECMooncakeWorkerMetadata is metadata.ECMooncakeWorkerMetadata
+
+    @pytest.mark.parametrize(
+        "metadata",
+        [
+            ECMooncakeConnectorMetadata(
+                loads=[
+                    ECMooncakeLoadSpec(
+                        mm_hash="load",
+                        num_token=2,
+                        nbytes=8,
+                        shape=(2, 4),
+                        dtype="float16",
+                        pushed=True,
+                        transfer_id="transfer",
+                        reservation_id="reservation",
+                        local=True,
+                    )
+                ],
+                pushes=[
+                    ECMooncakePushSpec(
+                        mm_hash="push",
+                        nbytes=8,
+                        shape=(2, 4),
+                        dtype="float16",
+                        consumer_zmq="tcp://127.0.0.1:1234",
+                        transfer_id="transfer",
+                        request_id="request",
+                    )
+                ],
+            ),
+            ECMooncakeWorkerMetadata(
+                loaded={"loaded"},
+                failed_loads={"failed"},
+                reclaimed={"reclaimed"},
+                pending_loads=True,
+                pending_saves=True,
+            ),
+        ],
+    )
+    def test_metadata_pickle_round_trip(self, metadata):
+        assert ForkingPickler.loads(ForkingPickler.dumps(metadata)) == metadata
 
 
 class TestECMooncakeWorkerMetadataAggregation:
