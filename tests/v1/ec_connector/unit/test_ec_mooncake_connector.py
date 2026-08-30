@@ -17,7 +17,7 @@ import pytest
 import torch
 import zmq
 
-from vllm.config import VllmConfig
+from vllm.config import ModelConfig, VllmConfig
 from vllm.distributed.ec_transfer.ec_connector.base import ECConnectorRole
 from vllm.distributed.ec_transfer.ec_connector.factory import ECConnectorFactory
 from vllm.distributed.ec_transfer.ec_connector.mooncake import metadata
@@ -115,6 +115,10 @@ def _wait_for_worker_io(
 @pytest.fixture
 def mock_vllm_config_producer():
     config = Mock(spec=VllmConfig)
+    config.model_config = Mock(spec=ModelConfig)
+    config.model_config.dtype = torch.float16
+    config.model_config.hf_config = None
+    config.model_config.get_inputs_embeds_size.return_value = 16
     config.parallel_config = Mock()
     config.parallel_config.tensor_parallel_size = 1
     config.parallel_config.pipeline_parallel_size = 1
@@ -254,6 +258,34 @@ class TestECMooncakeConnectorValidation:
         ):
             ECMooncakeConnector(mock_vllm_config_producer, ECConnectorRole.SCHEDULER)
 
+    def test_scheduler_hook_routes_to_scheduler_role(self, mock_vllm_config_producer):
+        with patch_ec_mooncake_deps():
+            connector = ECMooncakeConnector(
+                mock_vllm_config_producer, ECConnectorRole.SCHEDULER
+            )
+            scheduler = Mock()
+            scheduler.ensure_cache_available.return_value = True
+            connector._scheduler = scheduler
+            request = Mock()
+            try:
+                assert connector.ensure_cache_available(request, 7, {"local"})
+                scheduler.ensure_cache_available.assert_called_once_with(
+                    request, 7, {"local"}
+                )
+            finally:
+                connector.shutdown()
+
+    def test_worker_rejects_scheduler_hook(self, mock_vllm_config_producer):
+        with patch_ec_mooncake_deps():
+            connector = ECMooncakeConnector(
+                mock_vllm_config_producer, ECConnectorRole.WORKER
+            )
+            try:
+                with pytest.raises(AssertionError):
+                    connector.has_cache_item("hash")
+            finally:
+                connector.shutdown()
+
 
 class TestECMooncakeMetadata:
     def test_old_imports_reexport_packaged_metadata(self):
@@ -343,11 +375,14 @@ class TestECMooncakeSchedulerMetadata:
                 mock_vllm_config_consumer, ECConnectorRole.SCHEDULER
             )
             try:
-                with patch.object(scheduler, "_drain_push_notifications"):
+                with patch.object(scheduler._scheduler, "_drain_push_notifications"):
                     assert not scheduler.ensure_cache_available(request, 0)
                 mm_hash = request.mm_features[0].identifier
-                assert scheduler._consumer_scheduler_metrics["missing_event"] == 1
-                assert mm_hash in scheduler._consumer_missing_since
+                assert (
+                    scheduler._scheduler._consumer_scheduler_metrics["missing_event"]
+                    == 1
+                )
+                assert mm_hash in scheduler._scheduler._consumer_missing_since
             finally:
                 scheduler.shutdown()
 
@@ -369,15 +404,15 @@ class TestECMooncakeSchedulerMetadata:
                 mock_vllm_config_consumer, ECConnectorRole.SCHEDULER
             )
             try:
-                with patch.object(scheduler, "_drain_push_notifications"):
+                with patch.object(scheduler._scheduler, "_drain_push_notifications"):
                     assert not scheduler.ensure_cache_available(request, 0)
                     assert not scheduler.ensure_cache_available(request, 0)
-                assert scheduler._consumer_scheduler_metrics["stalled"] == 1
-                assert mm_hash in scheduler._stalled_hashes
+                assert scheduler._scheduler._consumer_scheduler_metrics["stalled"] == 1
+                assert mm_hash in scheduler._scheduler._stalled_hashes
                 # The stall is reported once, not once per scheduling pass.
-                with patch.object(scheduler, "_drain_push_notifications"):
+                with patch.object(scheduler._scheduler, "_drain_push_notifications"):
                     assert not scheduler.ensure_cache_available(request, 0)
-                assert scheduler._consumer_scheduler_metrics["stalled"] == 1
+                assert scheduler._scheduler._consumer_scheduler_metrics["stalled"] == 1
             finally:
                 scheduler.shutdown()
 
@@ -401,11 +436,11 @@ class TestECMooncakeSchedulerMetadata:
             )
             try:
                 for spec in specs:
-                    scheduler._index_pending_spec(spec)
-                scheduler._pop_pending_spec("transfer-0")
-                assert "hash" in scheduler._consumer_pending_since
-                scheduler._pop_pending_spec("transfer-1")
-                assert "hash" not in scheduler._consumer_pending_since
+                    scheduler._scheduler._index_pending_spec(spec)
+                scheduler._scheduler._pop_pending_spec("transfer-0")
+                assert "hash" in scheduler._scheduler._consumer_pending_since
+                scheduler._scheduler._pop_pending_spec("transfer-1")
+                assert "hash" not in scheduler._scheduler._consumer_pending_since
             finally:
                 scheduler.shutdown()
 
@@ -430,7 +465,7 @@ class TestECMooncakeSchedulerMetadata:
                         {"mm_hash": mm_hash, "transfer_id": "request-transfer"}
                     ]
                 }
-                scheduler._index_pending_spec(
+                scheduler._scheduler._index_pending_spec(
                     ECMooncakeLoadSpec(
                         mm_hash=mm_hash,
                         num_token=0,
@@ -443,16 +478,16 @@ class TestECMooncakeSchedulerMetadata:
                     )
                 )
                 with (
-                    patch.object(scheduler, "_drain_push_notifications"),
-                    patch.object(scheduler, "_queue_cancel") as cancel,
+                    patch.object(scheduler._scheduler, "_drain_push_notifications"),
+                    patch.object(scheduler._scheduler, "_queue_cancel") as cancel,
                 ):
                     assert scheduler.ensure_cache_available(request, 0, {mm_hash})
                     cancel.assert_not_called()
-                    assert "request-transfer" in scheduler._pending_specs
+                    assert "request-transfer" in scheduler._scheduler._pending_specs
 
                     # Once the entry is evicted the request can still get it.
                     assert not scheduler.ensure_cache_available(request, 0, set())
-                assert mm_hash in scheduler._loading_hashes
+                assert mm_hash in scheduler._scheduler._loading_hashes
             finally:
                 scheduler.shutdown()
 
@@ -476,7 +511,7 @@ class TestECMooncakeSchedulerMetadata:
                 mock_vllm_config_consumer, ECConnectorRole.SCHEDULER
             )
             try:
-                scheduler._index_pending_spec(
+                scheduler._scheduler._index_pending_spec(
                     ECMooncakeLoadSpec(
                         mm_hash=mm_hash,
                         num_token=0,
@@ -488,12 +523,12 @@ class TestECMooncakeSchedulerMetadata:
                         reservation_id="reservation",
                     )
                 )
-                with patch.object(scheduler, "_queue_cancel") as cancel:
+                with patch.object(scheduler._scheduler, "_queue_cancel") as cancel:
                     scheduler.update_state_after_free(request, 0)
                 # Cancelled by transfer: a shard's reservation id means
                 # nothing to its peers, so it is not passed along.
                 cancel.assert_called_once_with("consumed-transfer")
-                assert "consumed-transfer" not in scheduler._pending_specs
+                assert "consumed-transfer" not in scheduler._scheduler._pending_specs
             finally:
                 scheduler.shutdown()
 
@@ -531,27 +566,27 @@ class TestECMooncakeSchedulerMetadata:
                 mock_vllm_config_consumer, ECConnectorRole.SCHEDULER
             )
             try:
-                scheduler._ready_hashes.add(mm_hash)
-                scheduler._event_zmq_socket = Mock()
-                scheduler._event_zmq_socket.recv_json.side_effect = [
+                scheduler._scheduler._ready_hashes.add(mm_hash)
+                scheduler._scheduler._event_zmq_socket = Mock()
+                scheduler._scheduler._event_zmq_socket.recv_json.side_effect = [
                     event,
                     zmq.Again(),
                 ]
-                with patch.object(scheduler, "_queue_cancel") as cancel:
-                    scheduler._drain_push_notifications()
+                with patch.object(scheduler._scheduler, "_queue_cancel") as cancel:
+                    scheduler._scheduler._drain_push_notifications()
                 cancel.assert_not_called()
-                assert "later-transfer" in scheduler._pending_specs
+                assert "later-transfer" in scheduler._scheduler._pending_specs
 
                 # The scheduler frees the encoder cache entry.
                 scheduler.build_connector_meta(
                     SimpleNamespace(free_encoder_mm_hashes=[mm_hash])
                 )
-                assert mm_hash not in scheduler._ready_hashes
+                assert mm_hash not in scheduler._scheduler._ready_hashes
 
                 # The request that owns the transfer can still pick it up.
-                with patch.object(scheduler, "_drain_push_notifications"):
+                with patch.object(scheduler._scheduler, "_drain_push_notifications"):
                     assert not scheduler.ensure_cache_available(request, 0, set())
-                assert mm_hash in scheduler._loading_hashes
+                assert mm_hash in scheduler._scheduler._loading_hashes
             finally:
                 scheduler.shutdown()
 
@@ -576,22 +611,22 @@ class TestECMooncakeSchedulerMetadata:
                 mock_vllm_config_consumer, ECConnectorRole.SCHEDULER
             )
             try:
-                scheduler._event_shard_count = len(ports)
-                scheduler._cancelled_transfer_ids[transfer_id] = (
+                scheduler._scheduler._event_shard_count = len(ports)
+                scheduler._scheduler._cancelled_transfer_ids[transfer_id] = (
                     time.monotonic() + _LEASE_TTL_SECONDS
                 )
-                scheduler._event_zmq_socket = Mock()
-                scheduler._event_zmq_socket.recv_json.side_effect = [
+                scheduler._scheduler._event_zmq_socket = Mock()
+                scheduler._scheduler._event_zmq_socket.recv_json.side_effect = [
                     {**event, "shard": port} for port in ports
                 ] + [zmq.Again()]
 
-                scheduler._drain_push_notifications()
+                scheduler._scheduler._drain_push_notifications()
 
-                assert transfer_id not in scheduler._pending_specs
-                assert transfer_id not in scheduler._event_ready_shards
-                assert scheduler._consumer_scheduler_metrics["events_cancelled"] == (
-                    len(ports)
-                )
+                assert transfer_id not in scheduler._scheduler._pending_specs
+                assert transfer_id not in scheduler._scheduler._event_ready_shards
+                assert scheduler._scheduler._consumer_scheduler_metrics[
+                    "events_cancelled"
+                ] == len(ports)
             finally:
                 scheduler.shutdown()
 
@@ -623,34 +658,39 @@ class TestECMooncakeSchedulerMetadata:
         }
 
         def deliver(scheduler, *shards):
-            scheduler._event_zmq_socket.recv_json.side_effect = [
+            scheduler._scheduler._event_zmq_socket.recv_json.side_effect = [
                 {**event, "shard": shard} for shard in shards
             ] + [zmq.Again()]
-            scheduler._drain_pending = True
-            scheduler._drain_push_notifications()
+            scheduler._scheduler._drain_pending = True
+            scheduler._scheduler._drain_push_notifications()
 
         with patch_ec_mooncake_deps():
             scheduler = ECMooncakeConnector(
                 mock_vllm_config_consumer, ECConnectorRole.SCHEDULER
             )
             try:
-                scheduler._reservation_zmq_addr = "tcp://127.0.0.1:19101"
-                scheduler._event_shard_count = 4
-                scheduler._event_zmq_socket = Mock()
+                scheduler._scheduler._reservation_zmq_addr = "tcp://127.0.0.1:19101"
+                scheduler._scheduler._event_shard_count = 4
+                scheduler._scheduler._event_zmq_socket = Mock()
 
                 deliver(scheduler, 0, 1)
-                assert scheduler._event_ready_shards[transfer_id] == {0, 1}
+                assert scheduler._scheduler._event_ready_shards[transfer_id] == {0, 1}
 
-                with patch.object(scheduler, "_cancel_remote", return_value=True):
+                with patch.object(
+                    scheduler._scheduler, "_cancel_remote", return_value=True
+                ):
                     scheduler.update_state_after_free(request, 0)
-                assert transfer_id in scheduler._cancelled_transfer_ids
-                assert transfer_id not in scheduler._event_ready_shards
+                assert transfer_id in scheduler._scheduler._cancelled_transfer_ids
+                assert transfer_id not in scheduler._scheduler._event_ready_shards
 
                 deliver(scheduler, 2, 3)
 
-                assert transfer_id not in scheduler._pending_specs
-                assert transfer_id not in scheduler._event_ready_shards
-                assert scheduler._consumer_scheduler_metrics["events_cancelled"] == 2
+                assert transfer_id not in scheduler._scheduler._pending_specs
+                assert transfer_id not in scheduler._scheduler._event_ready_shards
+                assert (
+                    scheduler._scheduler._consumer_scheduler_metrics["events_cancelled"]
+                    == 2
+                )
             finally:
                 scheduler.shutdown()
 
@@ -666,37 +706,47 @@ class TestECMooncakeSchedulerMetadata:
                 mock_vllm_config_consumer, ECConnectorRole.SCHEDULER
             )
             try:
-                scheduler._reservation_zmq_addr = "tcp://127.0.0.1:19101"
-                scheduler._event_zmq_socket = Mock()
-                scheduler._event_zmq_socket.recv_json.side_effect = zmq.Again()
-                with patch.object(scheduler, "_cancel_remote", return_value=True):
+                scheduler._scheduler._reservation_zmq_addr = "tcp://127.0.0.1:19101"
+                scheduler._scheduler._event_zmq_socket = Mock()
+                scheduler._scheduler._event_zmq_socket.recv_json.side_effect = (
+                    zmq.Again()
+                )
+                with patch.object(
+                    scheduler._scheduler, "_cancel_remote", return_value=True
+                ):
                     for name in ("first", "second", "third"):
-                        scheduler._queue_cancel(name)
+                        scheduler._scheduler._queue_cancel(name)
 
                 now = time.monotonic()
-                assert scheduler._cancelled_transfer_ids["third"] > now
-                assert scheduler._cancelled_transfer_ids["third"] <= (
+                assert scheduler._scheduler._cancelled_transfer_ids["third"] > now
+                assert scheduler._scheduler._cancelled_transfer_ids["third"] <= (
                     now + _LEASE_TTL_SECONDS
                 )
 
                 # Ignored for exactly as long as the worker refuses to reserve
                 # the id again, and no longer. The drain is what sweeps.
-                scheduler._cancelled_transfer_ids["first"] = 0.0
-                scheduler._drain_pending = True
-                scheduler._drain_push_notifications()
-                assert list(scheduler._cancelled_transfer_ids) == ["second", "third"]
+                scheduler._scheduler._cancelled_transfer_ids["first"] = 0.0
+                scheduler._scheduler._drain_pending = True
+                scheduler._scheduler._drain_push_notifications()
+                assert list(scheduler._scheduler._cancelled_transfer_ids) == [
+                    "second",
+                    "third",
+                ]
 
                 # The count is the backstop for a rate that outruns the TTL.
                 with patch(
                     "vllm.distributed.ec_transfer.ec_connector."
-                    "mooncake_ec_connector._MAX_CANCELLED_TRANSFER_IDS",
+                    "mooncake.scheduler._MAX_CANCELLED_TRANSFER_IDS",
                     1,
                 ):
-                    scheduler._drain_pending = True
-                    scheduler._drain_push_notifications()
-                assert list(scheduler._cancelled_transfer_ids) == ["third"]
+                    scheduler._scheduler._drain_pending = True
+                    scheduler._scheduler._drain_push_notifications()
+                assert list(scheduler._scheduler._cancelled_transfer_ids) == ["third"]
                 assert (
-                    scheduler._consumer_scheduler_metrics["cancel_records_dropped"] == 2
+                    scheduler._scheduler._consumer_scheduler_metrics[
+                        "cancel_records_dropped"
+                    ]
+                    == 2
                 )
             finally:
                 scheduler.shutdown()
@@ -725,8 +775,10 @@ class TestECMooncakeSchedulerMetadata:
             )
             try:
                 with (
-                    patch.object(scheduler, "_drain_push_notifications"),
-                    patch.object(scheduler, "_send_control", return_value=None),
+                    patch.object(scheduler._scheduler, "_drain_push_notifications"),
+                    patch.object(
+                        scheduler._scheduler, "_control_request", return_value=None
+                    ),
                 ):
                     assert not scheduler.ensure_cache_available(request, 0, set())
                 assert scheduler.take_unavailable_requests() == {request.request_id}
@@ -734,7 +786,7 @@ class TestECMooncakeSchedulerMetadata:
                 assert scheduler.take_unavailable_requests() == set()
                 # A re-issued request gets a fresh window rather than the
                 # expired one, or it would fail before its push could land.
-                assert mm_hash not in scheduler._consumer_missing_since
+                assert mm_hash not in scheduler._scheduler._consumer_missing_since
             finally:
                 scheduler.shutdown()
 
@@ -762,11 +814,13 @@ class TestECMooncakeSchedulerMetadata:
                 mock_vllm_config_consumer, ECConnectorRole.SCHEDULER
             )
             try:
-                scheduler._reservation_zmq_addr = f"tcp://127.0.0.1:{ports[0]}"
+                scheduler._scheduler._reservation_zmq_addr = (
+                    f"tcp://127.0.0.1:{ports[0]}"
+                )
                 with patch.object(
-                    scheduler, "_send_control", side_effect=fake_send
+                    scheduler._scheduler, "_control_request", side_effect=fake_send
                 ) as send_control:
-                    scheduler._ensure_event_channel()
+                    scheduler._scheduler._ensure_event_channel()
 
                 subscribed = [
                     call.args[0]
@@ -774,16 +828,24 @@ class TestECMooncakeSchedulerMetadata:
                     if call.args[1]["op"] == "event_port"
                 ]
                 assert len(subscribed) == len(ports)
-                assert scheduler._event_shard_count == len(ports)
+                assert scheduler._scheduler._event_shard_count == len(ports)
 
                 event = {"transfer_id": "transfer-0"}
-                assert not scheduler._note_shard_ready({**event, "shard": ports[0]})
+                assert not scheduler._scheduler._note_shard_ready(
+                    {**event, "shard": ports[0]}
+                )
                 # The same rank reporting twice is not two ranks.
-                assert not scheduler._note_shard_ready({**event, "shard": ports[0]})
-                assert not scheduler._note_shard_ready({**event, "shard": ports[1]})
-                assert scheduler._note_shard_ready({**event, "shard": ports[2]})
+                assert not scheduler._scheduler._note_shard_ready(
+                    {**event, "shard": ports[0]}
+                )
+                assert not scheduler._scheduler._note_shard_ready(
+                    {**event, "shard": ports[1]}
+                )
+                assert scheduler._scheduler._note_shard_ready(
+                    {**event, "shard": ports[2]}
+                )
                 # Nothing is retained once the transfer is handed on.
-                assert "transfer-0" not in scheduler._event_ready_shards
+                assert "transfer-0" not in scheduler._scheduler._event_ready_shards
             finally:
                 scheduler.shutdown()
 
@@ -817,8 +879,8 @@ class TestECMooncakeSchedulerMetadata:
                 mock_vllm_config_consumer, ECConnectorRole.SCHEDULER
             )
             try:
-                scheduler._event_zmq_socket = Mock()
-                scheduler._event_zmq_socket.recv_json.side_effect = [
+                scheduler._scheduler._event_zmq_socket = Mock()
+                scheduler._scheduler._event_zmq_socket.recv_json.side_effect = [
                     {
                         "mm_hash": mm_hash,
                         "transfer_id": "only-transfer",
@@ -830,7 +892,7 @@ class TestECMooncakeSchedulerMetadata:
                     },
                     zmq.Again(),
                 ]
-                scheduler._drain_push_notifications()
+                scheduler._scheduler._drain_push_notifications()
 
                 assert not scheduler.ensure_cache_available(first, 0, set())
                 meta = scheduler.build_connector_meta(
@@ -844,7 +906,7 @@ class TestECMooncakeSchedulerMetadata:
                         )
                     )
                 )
-                assert not scheduler._pending_specs
+                assert not scheduler._scheduler._pending_specs
 
                 # The encoder cache evicts the entry.
                 scheduler.build_connector_meta(
@@ -853,10 +915,10 @@ class TestECMooncakeSchedulerMetadata:
 
                 # The second request has no transfer of its own, and the only
                 # transfer is spent. It must still be served.
-                with patch.object(scheduler, "_drain_push_notifications"):
+                with patch.object(scheduler._scheduler, "_drain_push_notifications"):
                     assert scheduler.has_cache_item(mm_hash)
                     assert not scheduler.ensure_cache_available(second, 0, set())
-                assert mm_hash in scheduler._loading_hashes
+                assert mm_hash in scheduler._scheduler._loading_hashes
                 reload = scheduler.build_connector_meta(
                     SimpleNamespace(free_encoder_mm_hashes=[])
                 )
@@ -882,7 +944,7 @@ class TestECMooncakeSchedulerMetadata:
                 mock_vllm_config_consumer, ECConnectorRole.SCHEDULER
             )
             try:
-                scheduler._note_resident(
+                scheduler._scheduler._note_resident(
                     ECMooncakeLoadSpec(
                         mm_hash=mm_hash,
                         num_token=0,
@@ -891,7 +953,7 @@ class TestECMooncakeSchedulerMetadata:
                         dtype="float32",
                     )
                 )
-                with patch.object(scheduler, "_drain_push_notifications"):
+                with patch.object(scheduler._scheduler, "_drain_push_notifications"):
                     assert scheduler.has_cache_item(mm_hash)
 
                 scheduler.update_connector_output(
@@ -901,9 +963,9 @@ class TestECMooncakeSchedulerMetadata:
                         )
                     )
                 )
-                with patch.object(scheduler, "_drain_push_notifications"):
+                with patch.object(scheduler._scheduler, "_drain_push_notifications"):
                     assert not scheduler.has_cache_item(mm_hash)
-                assert scheduler._resident_bytes == 0
+                assert scheduler._scheduler._resident_bytes == 0
             finally:
                 scheduler.shutdown()
 
@@ -928,13 +990,19 @@ class TestECMooncakeSchedulerMetadata:
             scheduler = ECMooncakeConnector(
                 mock_vllm_config_consumer, ECConnectorRole.SCHEDULER
             )
-            scheduler._event_zmq_socket = Mock()
-            scheduler._event_zmq_socket.recv_json.side_effect = [event, zmq.Again()]
-            scheduler._loading_hashes.add("hash")
+            scheduler._scheduler._event_zmq_socket = Mock()
+            scheduler._scheduler._event_zmq_socket.recv_json.side_effect = [
+                event,
+                zmq.Again(),
+            ]
+            scheduler._scheduler._loading_hashes.add("hash")
 
-            scheduler._drain_push_notifications()
+            scheduler._scheduler._drain_push_notifications()
 
-            assert scheduler._pending_specs["next-transfer"].reservation_id == "next"
+            assert (
+                scheduler._scheduler._pending_specs["next-transfer"].reservation_id
+                == "next"
+            )
 
     def test_build_connector_meta_clears_pending(
         self, mock_vllm_config_consumer, mock_request_with_3_mm
@@ -952,9 +1020,9 @@ class TestECMooncakeSchedulerMetadata:
                 dtype="float32",
                 transfer_id="transfer",
             )
-            scheduler._index_pending_spec(load_spec)
-            scheduler._load_specs[mm_hash] = load_spec
-            scheduler._mm_datas_need_loads[mm_hash] = 100
+            scheduler._scheduler._index_pending_spec(load_spec)
+            scheduler._scheduler._load_specs[mm_hash] = load_spec
+            scheduler._scheduler._mm_datas_need_loads[mm_hash] = 100
             meta = scheduler.build_connector_meta(
                 Mock(spec=SchedulerOutput, free_encoder_mm_hashes=[])
             )
@@ -962,8 +1030,8 @@ class TestECMooncakeSchedulerMetadata:
             assert len(meta.loads) == 1
             assert meta.loads[0].mm_hash == mm_hash
             assert meta.loads[0].num_token == 100
-            assert scheduler._mm_datas_need_loads == {}
-            assert "transfer" not in scheduler._pending_specs
+            assert scheduler._scheduler._mm_datas_need_loads == {}
+            assert "transfer" not in scheduler._scheduler._pending_specs
 
     def test_producer_does_not_build_load_metadata(
         self, mock_vllm_config_producer, mock_request_with_3_mm
@@ -1024,7 +1092,7 @@ class TestECMooncakeSchedulerMetadata:
             )
         ]
         assert next_meta.pushes == []
-        assert "transfer-1" not in scheduler._prepared_push_transfer_ids
+        assert "transfer-1" not in scheduler._scheduler._prepared_push_transfer_ids
 
     def test_producer_uses_deepstack_encoder_cache_width(
         self, mock_vllm_config_producer, mock_request_with_3_mm
@@ -1074,7 +1142,7 @@ class TestECMooncakeSchedulerMetadata:
                 mock_vllm_config_producer, ECConnectorRole.SCHEDULER
             )
             with patch.object(
-                scheduler,
+                scheduler._scheduler,
                 "_placeholder_metadata_fields",
                 return_value={"image_grid_thw"},
             ):
@@ -1192,9 +1260,9 @@ class TestECMooncakeWorkerTransfer:
                 reservation_data["_received_at"] -= _LEASE_TTL_SECONDS
                 consumer._push_reservations["transfer-1"].expires_at = 0
                 with patch.object(
-                    scheduler,
-                    "_send_control",
-                    wraps=scheduler._send_control,
+                    scheduler._scheduler,
+                    "_control_request",
+                    wraps=scheduler._scheduler._control_request,
                 ) as send_control:
                     assert not scheduler.has_cache_item("hash")
                     assert not scheduler.has_cache_item("hash")
@@ -1219,7 +1287,7 @@ class TestECMooncakeWorkerTransfer:
                     # Still just the two setup requests: polling for readiness
                     # must not re-open the channel.
                     assert send_control.call_count == 2
-                load = scheduler._pending_specs["transfer-1"]
+                load = scheduler._scheduler._pending_specs["transfer-1"]
                 consumer.bind_connector_metadata(
                     ECMooncakeConnectorMetadata(loads=[load])
                 )
@@ -1341,7 +1409,7 @@ class TestECMooncakeWorkerTransfer:
                 while not scheduler.has_cache_item("hash"):
                     assert time.monotonic() < deadline
                     time.sleep(0.01)
-                load = scheduler._pop_pending_spec("transfer-1")
+                load = scheduler._scheduler._pop_pending_spec("transfer-1")
                 assert load is not None
                 load.num_token = 4
                 consumer.bind_connector_metadata(
@@ -1372,7 +1440,7 @@ class TestECMooncakeWorkerTransfer:
                 while not scheduler.has_cache_item("hash"):
                     assert time.monotonic() < deadline
                     time.sleep(0.01)
-                cached_load = scheduler._pop_pending_spec("transfer-2")
+                cached_load = scheduler._scheduler._pop_pending_spec("transfer-2")
                 assert cached_load is not None
                 cached_load.num_token = 4
                 consumer.bind_connector_metadata(
