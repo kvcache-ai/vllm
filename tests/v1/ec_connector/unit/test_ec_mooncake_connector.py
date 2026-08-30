@@ -6,11 +6,13 @@ from __future__ import annotations
 
 import copy
 import ctypes
+import importlib
 import socket
+import sys
 import time
 from contextlib import contextmanager
 from multiprocessing.reduction import ForkingPickler
-from types import SimpleNamespace
+from types import ModuleType, SimpleNamespace
 from unittest.mock import Mock, patch
 
 import pytest
@@ -18,9 +20,16 @@ import torch
 import zmq
 
 from vllm.config import ModelConfig, VllmConfig
-from vllm.distributed.ec_transfer.ec_connector.base import ECConnectorRole
+from vllm.distributed.ec_transfer.ec_connector import mooncake_ec_connector
+from vllm.distributed.ec_transfer.ec_connector.base import (
+    ECConnectorMetadata,
+    ECConnectorRole,
+)
 from vllm.distributed.ec_transfer.ec_connector.factory import ECConnectorFactory
 from vllm.distributed.ec_transfer.ec_connector.mooncake import metadata
+from vllm.distributed.ec_transfer.ec_connector.mooncake.scheduler import (
+    ECMooncakeScheduler,
+)
 from vllm.distributed.ec_transfer.ec_connector.mooncake.worker import (
     _LEASE_TTL_SECONDS,
     _ConsumerPoolAllocation,
@@ -165,7 +174,8 @@ def patch_ec_mooncake_deps():
             CopyingFakeTransferEngine,
         ),
         patch(
-            "vllm.distributed.ec_transfer.ec_connector.mooncake.worker._MOONCAKE_IMPORT_ERROR",
+            "vllm.distributed.ec_transfer.ec_connector.mooncake."
+            "_availability._MOONCAKE_IMPORT_ERROR",
             None,
         ),
         patch(
@@ -181,7 +191,20 @@ class TestECMooncakeFactory:
         cls = ECConnectorFactory.get_connector_class(
             Mock(ec_connector="ECMooncakeConnector")
         )
-        assert cls.__name__ == "ECMooncakeConnector"
+        assert cls is ECMooncakeConnector
+        assert (
+            cls.__module__
+            == "vllm.distributed.ec_transfer.ec_connector.mooncake_ec_connector"
+        )
+
+    def test_public_exports_are_compatible_and_narrow(self):
+        assert mooncake_ec_connector.__all__ == [
+            "ECMooncakeConnector",
+            "ECMooncakeConnectorMetadata",
+            "ECMooncakeLoadSpec",
+            "ECMooncakePushSpec",
+            "ECMooncakeWorkerMetadata",
+        ]
 
 
 class TestContiguousAllocator:
@@ -200,6 +223,27 @@ class TestContiguousAllocator:
 
 
 class TestECMooncakeConnectorValidation:
+    @pytest.mark.parametrize(
+        "role", [ECConnectorRole.SCHEDULER, ECConnectorRole.WORKER]
+    )
+    def test_requires_transfer_engine_symbol_for_each_role(
+        self, mock_vllm_config_producer, monkeypatch, role
+    ):
+        from vllm.distributed.ec_transfer.ec_connector.mooncake import _availability
+
+        fake_package = ModuleType("mooncake")
+        fake_package.__path__ = []
+        fake_engine = ModuleType("mooncake.engine")
+        try:
+            with monkeypatch.context() as context:
+                context.setitem(sys.modules, "mooncake", fake_package)
+                context.setitem(sys.modules, "mooncake.engine", fake_engine)
+                importlib.reload(_availability)
+                with pytest.raises(ImportError, match="mooncake-transfer-engine"):
+                    ECMooncakeConnector(mock_vllm_config_producer, role)
+        finally:
+            importlib.reload(_availability)
+
     def test_rejects_sharded_producer(self, mock_vllm_config_producer):
         """One copy of each encoder output, so sharding only duplicates it."""
         mock_vllm_config_producer.parallel_config.tensor_parallel_size = 2
@@ -263,74 +307,239 @@ class TestECMooncakeConnectorValidation:
         ):
             ECMooncakeConnector(mock_vllm_config_producer, ECConnectorRole.SCHEDULER)
 
-    def test_scheduler_hook_routes_to_scheduler_role(self, mock_vllm_config_producer):
-        with patch_ec_mooncake_deps():
+    def test_scheduler_hooks_route_exactly(self, mock_vllm_config_producer):
+        scheduler = Mock()
+        scheduler.take_unavailable_requests.return_value = {"unavailable"}
+        scheduler.has_cache_item.return_value = True
+        scheduler.ensure_cache_available.return_value = False
+        scheduler.build_connector_meta.return_value = "metadata"
+        scheduler.has_pending_push_work.return_value = True
+        scheduler.request_finished.return_value = (True, {"result": 1})
+        with patch.object(
+            ECMooncakeScheduler,
+            "from_vllm_config",
+            return_value=scheduler,
+        ) as from_vllm_config:
             connector = ECMooncakeConnector(
                 mock_vllm_config_producer, ECConnectorRole.SCHEDULER
             )
-            scheduler = Mock()
-            scheduler.ensure_cache_available.return_value = True
-            connector._scheduler = scheduler
             request = Mock()
+            scheduler_output = Mock()
+            connector_output = Mock()
             try:
-                assert connector.ensure_cache_available(request, 7, {"local"})
-                scheduler.ensure_cache_available.assert_called_once_with(
-                    request, 7, {"local"}
-                )
+                assert connector.take_unavailable_requests() == {"unavailable"}
+                assert connector.has_cache_item("hash") is True
+                assert connector.ensure_cache_available(request, 7, {"local"}) is False
+                connector.update_state_after_alloc(request, 2)
+                connector.update_state_after_free(request, 3)
+                assert connector.build_connector_meta(scheduler_output) == "metadata"
+                connector.update_connector_output(connector_output)
+                assert connector.has_pending_push_work() is True
+                assert connector.request_finished(request) == (True, {"result": 1})
             finally:
                 connector.shutdown()
 
-    def test_worker_rejects_scheduler_hook(self, mock_vllm_config_producer):
-        with patch_ec_mooncake_deps():
+        from_vllm_config.assert_called_once_with(mock_vllm_config_producer)
+        scheduler.take_unavailable_requests.assert_called_once_with()
+        scheduler.has_cache_item.assert_called_once_with("hash")
+        scheduler.ensure_cache_available.assert_called_once_with(request, 7, {"local"})
+        scheduler.update_state_after_alloc.assert_called_once_with(request, 2)
+        scheduler.update_state_after_free.assert_called_once_with(request, 3)
+        scheduler.build_connector_meta.assert_called_once_with(scheduler_output)
+        scheduler.update_connector_output.assert_called_once_with(connector_output)
+        scheduler.has_pending_push_work.assert_called_once_with()
+        scheduler.request_finished.assert_called_once_with(request)
+        scheduler.close.assert_called_once_with()
+
+    def test_worker_hooks_route_exactly(self, mock_vllm_config_producer):
+        metadata = ECMooncakeConnectorMetadata()
+        worker = Mock()
+        worker.get_finished.return_value = ({"saved"}, {"loaded"})
+        worker.build_connector_worker_meta.return_value = "worker-metadata"
+        with patch(
+            "vllm.distributed.ec_transfer.ec_connector."
+            "mooncake_ec_connector.ECMooncakeWorker",
+            return_value=worker,
+        ) as worker_type:
+            connector = ECMooncakeConnector(
+                mock_vllm_config_producer, ECConnectorRole.WORKER
+            )
+            connector.bind_connector_metadata(metadata)
+            encoder_cache: dict[str, torch.Tensor] = {}
+            try:
+                connector.start_worker_services()
+                connector.start_save_caches(encoder_cache=encoder_cache, marker=1)
+                connector.start_load_caches(encoder_cache, marker=2)
+                connector.save_caches(encoder_cache, "hash", marker=3)
+                assert connector.get_finished({"finished"}) == (
+                    {"saved"},
+                    {"loaded"},
+                )
+                assert connector.build_connector_worker_meta() == "worker-metadata"
+            finally:
+                connector.shutdown()
+
+        worker_type.assert_called_once_with(mock_vllm_config_producer)
+        worker.start_services.assert_called_once_with()
+        worker.start_save_caches.assert_called_once_with(
+            metadata, encoder_cache=encoder_cache, marker=1
+        )
+        worker.start_load_caches.assert_called_once_with(
+            metadata, encoder_cache, marker=2
+        )
+        worker.save_caches.assert_called_once_with(encoder_cache, "hash", marker=3)
+        worker.get_finished.assert_called_once_with({"finished"})
+        worker.build_connector_worker_meta.assert_called_once_with()
+        worker.close.assert_called_once_with()
+
+    @pytest.mark.parametrize(
+        ("method", "args"),
+        [
+            ("start_save_caches", ()),
+            ("start_load_caches", ({},)),
+        ],
+    )
+    def test_worker_load_and_save_reject_wrong_metadata(
+        self, mock_vllm_config_producer, method, args
+    ):
+        class OtherMetadata(ECConnectorMetadata):
+            pass
+
+        worker = Mock()
+        with patch(
+            "vllm.distributed.ec_transfer.ec_connector."
+            "mooncake_ec_connector.ECMooncakeWorker",
+            return_value=worker,
+        ):
+            connector = ECMooncakeConnector(
+                mock_vllm_config_producer, ECConnectorRole.WORKER
+            )
+            connector.bind_connector_metadata(OtherMetadata())
+            try:
+                with pytest.raises(AssertionError):
+                    getattr(connector, method)(*args)
+            finally:
+                connector.shutdown()
+
+        getattr(worker, method).assert_not_called()
+
+    @pytest.mark.parametrize(
+        ("method", "args", "kwargs"),
+        [
+            ("start_worker_services", (), {}),
+            ("start_save_caches", (), {}),
+            ("start_load_caches", ({},), {}),
+            ("save_caches", ({}, "hash"), {}),
+            ("get_finished", (set(),), {}),
+            ("build_connector_worker_meta", (), {}),
+        ],
+    )
+    def test_scheduler_rejects_worker_hooks(
+        self, mock_vllm_config_producer, method, args, kwargs
+    ):
+        with patch.object(
+            ECMooncakeScheduler,
+            "from_vllm_config",
+            return_value=Mock(),
+        ):
+            connector = ECMooncakeConnector(
+                mock_vllm_config_producer, ECConnectorRole.SCHEDULER
+            )
+            try:
+                with pytest.raises(AssertionError):
+                    getattr(connector, method)(*args, **kwargs)
+            finally:
+                connector.shutdown()
+
+    @pytest.mark.parametrize(
+        ("method", "args", "kwargs"),
+        [
+            ("take_unavailable_requests", (), {}),
+            ("has_cache_item", ("hash",), {}),
+            ("ensure_cache_available", (Mock(), 0, set()), {}),
+            ("update_state_after_alloc", (Mock(), 0), {}),
+            ("update_state_after_free", (Mock(), 0), {}),
+            ("build_connector_meta", (Mock(),), {}),
+            ("update_connector_output", (Mock(),), {}),
+            ("has_pending_push_work", (), {}),
+            ("request_finished", (Mock(),), {}),
+        ],
+    )
+    def test_worker_rejects_scheduler_hooks(
+        self, mock_vllm_config_producer, method, args, kwargs
+    ):
+        with patch(
+            "vllm.distributed.ec_transfer.ec_connector."
+            "mooncake_ec_connector.ECMooncakeWorker",
+            return_value=Mock(),
+        ):
             connector = ECMooncakeConnector(
                 mock_vllm_config_producer, ECConnectorRole.WORKER
             )
             try:
                 with pytest.raises(AssertionError):
-                    connector.has_cache_item("hash")
+                    getattr(connector, method)(*args, **kwargs)
             finally:
                 connector.shutdown()
 
-    def test_worker_hooks_receive_bound_metadata(self, mock_vllm_config_producer):
-        metadata = ECMooncakeConnectorMetadata()
+    @pytest.mark.parametrize(
+        ("role", "active", "inactive"),
+        [
+            (ECConnectorRole.SCHEDULER, "_scheduler", "_worker"),
+            (ECConnectorRole.WORKER, "_worker", "_scheduler"),
+        ],
+    )
+    def test_exactly_one_role_and_idempotent_shutdown(
+        self, mock_vllm_config_producer, role, active, inactive
+    ):
+        scheduler = Mock()
         worker = Mock()
         with (
-            patch_ec_mooncake_deps(),
+            patch.object(
+                ECMooncakeScheduler,
+                "from_vllm_config",
+                return_value=scheduler,
+            ),
             patch(
                 "vllm.distributed.ec_transfer.ec_connector."
                 "mooncake_ec_connector.ECMooncakeWorker",
                 return_value=worker,
             ),
         ):
-            connector = ECMooncakeConnector(
-                mock_vllm_config_producer, ECConnectorRole.WORKER
-            )
-            connector.bind_connector_metadata(metadata)
-            encoder_cache: dict[str, torch.Tensor] = {}
-
-            connector.start_save_caches(encoder_cache=encoder_cache)
-            connector.start_load_caches(encoder_cache, marker=True)
+            connector = ECMooncakeConnector(mock_vllm_config_producer, role)
+            assert getattr(connector, active) is not None
+            assert getattr(connector, inactive) is None
+            assert set(connector.__dict__) - {
+                "_connector_metadata",
+                "_vllm_config",
+                "_role",
+                "_is_producer",
+                "_is_consumer",
+            } == {"_scheduler", "_worker", "_closed"}
             connector.shutdown()
             connector.shutdown()
 
-        worker.start_save_caches.assert_called_once_with(
-            metadata, encoder_cache=encoder_cache
-        )
-        worker.start_load_caches.assert_called_once_with(
-            metadata, encoder_cache, marker=True
-        )
-        worker.close.assert_called_once_with()
+        if role == ECConnectorRole.SCHEDULER:
+            scheduler.close.assert_called_once_with()
+            worker.close.assert_not_called()
+        else:
+            worker.close.assert_called_once_with()
+            scheduler.close.assert_not_called()
 
-    def test_scheduler_rejects_worker_hook(self, mock_vllm_config_producer):
-        with patch_ec_mooncake_deps():
-            connector = ECMooncakeConnector(
-                mock_vllm_config_producer, ECConnectorRole.SCHEDULER
-            )
-            try:
-                with pytest.raises(AssertionError):
-                    connector.start_worker_services()
-            finally:
-                connector.shutdown()
+    def test_rejects_unknown_role(self, mock_vllm_config_producer):
+        invalid_role = Mock(name="invalid_role")
+        with pytest.raises(ValueError, match="Unknown EC connector role"):
+            ECMooncakeConnector(mock_vllm_config_producer, invalid_role)
+
+    def test_del_is_best_effort(self):
+        connector = object.__new__(ECMooncakeConnector)
+        with patch.object(
+            ECMooncakeConnector,
+            "shutdown",
+            side_effect=RuntimeError("shutdown failed"),
+        ) as shutdown:
+            connector.__del__()
+        shutdown.assert_called_once_with()
 
 
 class TestECMooncakeMetadata:

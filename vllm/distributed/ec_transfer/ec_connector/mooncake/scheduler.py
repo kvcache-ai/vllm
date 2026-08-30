@@ -4,19 +4,25 @@
 from __future__ import annotations
 
 import math
+import threading
 import time
 from collections import Counter, OrderedDict, deque
 from collections.abc import Callable, Collection
-from concurrent.futures import Future
+from concurrent.futures import Future, ThreadPoolExecutor
 from contextlib import suppress
 from dataclasses import dataclass
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import torch
 import zmq
 
-from vllm.config import ModelConfig
 from vllm.distributed.ec_transfer.ec_connector.base import ECConnectorMetadata
+from vllm.distributed.ec_transfer.ec_connector.cpu.common import (
+    _get_encoder_cache_hidden_dim,
+)
+from vllm.distributed.ec_transfer.ec_connector.mooncake._availability import (
+    ensure_mooncake_available,
+)
 from vllm.distributed.ec_transfer.ec_connector.mooncake.metadata import (
     ECMooncakeConnectorMetadata,
     ECMooncakeLoadSpec,
@@ -27,12 +33,60 @@ from vllm.logger import init_logger
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.outputs import ECConnectorOutput
 
+if TYPE_CHECKING:
+    from vllm.config import ModelConfig, VllmConfig
+
 logger = init_logger(__name__)
 
 _LEASE_TTL_SECONDS = 300
 _DRAIN_MIN_INTERVAL = 0.005
 _MAX_PENDING_EVENTS = 4096
 _MAX_CANCELLED_TRANSFER_IDS = 1 << 16
+
+
+class _SchedulerControlChannel:
+    """Reusable per-thread REQ sockets for scheduler control requests."""
+
+    def __init__(self, timeout_ms: int) -> None:
+        self._context = zmq.Context()
+        self._timeout_ms = timeout_ms
+        self._local = threading.local()
+
+    def _sockets(self) -> dict[str, zmq.Socket]:
+        sockets = getattr(self._local, "sockets", None)
+        if sockets is None:
+            sockets = {}
+            self._local.sockets = sockets
+        return sockets
+
+    def _discard(self, addr: str) -> None:
+        socket = self._sockets().pop(addr, None)
+        if socket is not None:
+            socket.close(linger=0)
+
+    def request(self, addr: str, payload: dict[str, Any]) -> Any:
+        sockets = self._sockets()
+        socket = sockets.get(addr)
+        if socket is None:
+            socket = self._context.socket(zmq.REQ)
+            socket.setsockopt(zmq.RCVTIMEO, self._timeout_ms)
+            socket.setsockopt(zmq.SNDTIMEO, self._timeout_ms)
+            socket.setsockopt(zmq.LINGER, 0)
+            socket.connect(addr)
+            sockets[addr] = socket
+        try:
+            socket.send_json(payload)
+            response = socket.recv_json()
+        except Exception:
+            self._discard(addr)
+            raise
+        assert isinstance(response, dict)
+        if not response.get("ok"):
+            raise RuntimeError(response.get("error", "EC control request failed"))
+        return response.get("result")
+
+    def close(self) -> None:
+        self._context.destroy(linger=0)
 
 
 @dataclass(frozen=True)
@@ -47,6 +101,82 @@ class ECMooncakeSchedulerConfig:
 
 
 class ECMooncakeScheduler:
+    @classmethod
+    def from_vllm_config(cls, vllm_config: VllmConfig) -> ECMooncakeScheduler:
+        ensure_mooncake_available()
+        parallel_config = vllm_config.parallel_config
+        ec_cfg = vllm_config.ec_transfer_config
+        assert ec_cfg is not None
+        if ec_cfg.is_ec_producer:
+            if parallel_config.tensor_parallel_size > 1:
+                raise ValueError(
+                    "ECMooncakeConnector producers require tensor_parallel_size=1."
+                )
+            if parallel_config.pipeline_parallel_size > 1:
+                raise ValueError(
+                    "ECMooncakeConnector producers do not support pipeline parallelism."
+                )
+            if parallel_config.data_parallel_size > 1:
+                raise ValueError(
+                    "ECMooncakeConnector producers require data_parallel_size=1."
+                )
+
+        registered_capacity = int(ec_cfg.ec_buffer_size)
+        if registered_capacity <= 0:
+            raise ValueError("ECMooncakeConnector requires ec_buffer_size > 0.")
+
+        extra = ec_cfg.ec_connector_extra_config
+        control_port_offset = (
+            parallel_config.data_parallel_index * parallel_config.tensor_parallel_size
+        )
+        reservation_port = extra.get("reservation_zmq_port")
+        reservation_zmq_addr: str | None = extra.get("reservation_zmq_addr")
+        if reservation_zmq_addr is None and reservation_port is not None:
+            base = int(reservation_port) + control_port_offset
+            reservation_zmq_addr = f"tcp://127.0.0.1:{base}"
+        if ec_cfg.is_ec_consumer and not reservation_zmq_addr:
+            raise ValueError(
+                "ec_consumer with ECMooncakeConnector requires "
+                "reservation_zmq_port or reservation_zmq_addr."
+            )
+
+        control_channel = _SchedulerControlChannel(
+            int(float(extra.get("control_timeout_s", 30)) * 1000)
+        )
+        control_executor = ThreadPoolExecutor(
+            max_workers=int(extra.get("control_max_workers", 8)),
+            thread_name_prefix="ec-mooncake-control",
+        )
+
+        def close_control() -> None:
+            control_executor.shutdown(wait=True, cancel_futures=True)
+            control_channel.close()
+
+        encoder_cache_hidden_dim = (
+            _get_encoder_cache_hidden_dim(vllm_config)
+            if ec_cfg.is_ec_producer
+            else None
+        )
+        return cls(
+            ECMooncakeSchedulerConfig(
+                is_producer=ec_cfg.is_ec_producer,
+                is_consumer=ec_cfg.is_ec_consumer,
+                reservation_zmq_addr=reservation_zmq_addr,
+                consumer_pool_capacity=int(
+                    extra.get("consumer_buffer_pool_size", registered_capacity)
+                ),
+                push_wait_timeout=float(extra.get("push_wait_timeout_s", 60)),
+                consumer_metrics_log_interval=float(
+                    extra.get("consumer_metrics_log_interval", 10)
+                ),
+                encoder_cache_hidden_dim=encoder_cache_hidden_dim,
+            ),
+            model_config=vllm_config.model_config,
+            control_request=control_channel.request,
+            submit_control=control_executor.submit,
+            close_control=close_control,
+        )
+
     def __init__(
         self,
         config: ECMooncakeSchedulerConfig,

@@ -26,6 +26,9 @@ import torch
 import zmq
 
 from vllm.config import VllmConfig
+from vllm.distributed.ec_transfer.ec_connector.mooncake._availability import (
+    ensure_mooncake_available,
+)
 from vllm.distributed.ec_transfer.ec_connector.mooncake.metadata import (
     ECMooncakeConnectorMetadata,
     ECMooncakeLoadSpec,
@@ -51,22 +54,10 @@ _MAX_PENDING_EVENTS = 4096
 # outruns that TTL; the race it guards is a single drain interval wide.
 _MAX_CANCELLED_TRANSFER_IDS = 1 << 16
 
-_MOONCAKE_IMPORT_ERROR: ImportError | None
 try:
     from mooncake.engine import TransferEngine
-except ImportError as e:
+except ImportError:
     TransferEngine = None  # type: ignore[misc, assignment]
-    _MOONCAKE_IMPORT_ERROR = e
-else:
-    _MOONCAKE_IMPORT_ERROR = None
-
-
-def _ensure_mooncake_available() -> None:
-    if _MOONCAKE_IMPORT_ERROR is not None or TransferEngine is None:
-        raise ImportError(
-            "Install mooncake-transfer-engine (see "
-            "https://github.com/kvcache-ai/Mooncake ) to use ECMooncakeConnector."
-        ) from _MOONCAKE_IMPORT_ERROR
 
 
 @dataclass
@@ -600,7 +591,28 @@ class ECMooncakeWorker:
     """
 
     def __init__(self, vllm_config: VllmConfig):
+        ensure_mooncake_available()
         parallel_config = vllm_config.parallel_config
+        ec_cfg = vllm_config.ec_transfer_config
+        assert ec_cfg is not None
+        if ec_cfg.is_ec_producer:
+            if parallel_config.tensor_parallel_size > 1:
+                raise ValueError(
+                    "ECMooncakeConnector producers require tensor_parallel_size=1."
+                )
+            if parallel_config.pipeline_parallel_size > 1:
+                raise ValueError(
+                    "ECMooncakeConnector producers do not support pipeline parallelism."
+                )
+            if parallel_config.data_parallel_size > 1:
+                raise ValueError(
+                    "ECMooncakeConnector producers require data_parallel_size=1."
+                )
+
+        registered_capacity = int(ec_cfg.ec_buffer_size)
+        if registered_capacity <= 0:
+            raise ValueError("ECMooncakeConnector requires ec_buffer_size > 0.")
+
         # Each data-parallel replica runs its own scheduler and its own control
         # channels, so their ports must not overlap. `data_parallel_index` is the
         # only field that identifies the replica in both cases: a non-MoE replica
@@ -612,8 +624,6 @@ class ECMooncakeWorker:
             parallel_config.data_parallel_index * parallel_config.tensor_parallel_size
         )
 
-        ec_cfg = vllm_config.ec_transfer_config
-        assert ec_cfg is not None
         self.is_producer = ec_cfg.is_ec_producer
         self.is_consumer = ec_cfg.is_ec_consumer
         self._ec_cfg = ec_cfg
@@ -623,7 +633,7 @@ class ECMooncakeWorker:
         self._reservation_zmq_port = (
             int(reservation_port) if reservation_port is not None else None
         )
-        self._registered_capacity = int(self._ec_cfg.ec_buffer_size)
+        self._registered_capacity = registered_capacity
         pool_size = self._extra.get(
             "consumer_buffer_pool_size", self._registered_capacity
         )
