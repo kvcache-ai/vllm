@@ -20,15 +20,16 @@ from collections.abc import Callable
 from concurrent.futures import Future, ThreadPoolExecutor
 from contextlib import suppress
 from dataclasses import dataclass, field
-from typing import Any, Generic, TypeVar
+from typing import TYPE_CHECKING, Any, Generic, TypeVar
 
 import torch
 import zmq
 
-from vllm.config import VllmConfig
+from vllm.distributed.ec_transfer.ec_connector.base import ECConnectorRole
 from vllm.distributed.ec_transfer.ec_connector.mooncake._availability import (
     ensure_mooncake_available,
 )
+from vllm.distributed.ec_transfer.ec_connector.mooncake.config import MooncakeECConfig
 from vllm.distributed.ec_transfer.ec_connector.mooncake.metadata import (
     ECMooncakeConnectorMetadata,
     ECMooncakeLoadSpec,
@@ -39,6 +40,9 @@ from vllm.logger import init_logger
 from vllm.utils.network_utils import get_ip
 
 logger = init_logger(__name__)
+
+if TYPE_CHECKING:
+    from vllm.config import VllmConfig
 
 _T = TypeVar("_T")
 
@@ -590,54 +594,20 @@ class ECMooncakeWorker:
     caller's responsibility, not something this connector can detect.
     """
 
-    def __init__(self, vllm_config: VllmConfig):
+    @classmethod
+    def from_vllm_config(cls, vllm_config: VllmConfig) -> ECMooncakeWorker:
         ensure_mooncake_available()
-        parallel_config = vllm_config.parallel_config
-        ec_cfg = vllm_config.ec_transfer_config
-        assert ec_cfg is not None
-        if ec_cfg.is_ec_producer:
-            if parallel_config.tensor_parallel_size > 1:
-                raise ValueError(
-                    "ECMooncakeConnector producers require tensor_parallel_size=1."
-                )
-            if parallel_config.pipeline_parallel_size > 1:
-                raise ValueError(
-                    "ECMooncakeConnector producers do not support pipeline parallelism."
-                )
-            if parallel_config.data_parallel_size > 1:
-                raise ValueError(
-                    "ECMooncakeConnector producers require data_parallel_size=1."
-                )
-
-        registered_capacity = int(ec_cfg.ec_buffer_size)
-        if registered_capacity <= 0:
-            raise ValueError("ECMooncakeConnector requires ec_buffer_size > 0.")
-
-        # Each data-parallel replica runs its own scheduler and its own control
-        # channels, so their ports must not overlap. `data_parallel_index` is the
-        # only field that identifies the replica in both cases: a non-MoE replica
-        # is reconfigured to look like DP=1, which resets `data_parallel_rank`
-        # and `data_parallel_size`. Deriving the offset from the config rather
-        # than from a process group keeps the scheduler, which has no groups, in
-        # agreement with its workers.
-        self._control_port_offset = (
-            parallel_config.data_parallel_index * parallel_config.tensor_parallel_size
+        return cls(
+            MooncakeECConfig.from_vllm_config(vllm_config, ECConnectorRole.WORKER)
         )
 
-        self.is_producer = ec_cfg.is_ec_producer
-        self.is_consumer = ec_cfg.is_ec_consumer
-        self._ec_cfg = ec_cfg
-        self._extra = self._ec_cfg.ec_connector_extra_config
-        self._protocol: str = self._extra.get("mooncake_protocol", "rdma")
-        reservation_port = self._extra.get("reservation_zmq_port")
-        self._reservation_zmq_port = (
-            int(reservation_port) if reservation_port is not None else None
-        )
-        self._registered_capacity = registered_capacity
-        pool_size = self._extra.get(
-            "consumer_buffer_pool_size", self._registered_capacity
-        )
-        self._consumer_pool_capacity = int(pool_size)
+    def __init__(self, config: MooncakeECConfig):
+        self.is_producer = config.is_producer
+        self.is_consumer = config.is_consumer
+        self._protocol = config.protocol
+        self._buffer_device = config.buffer_device
+        self._reservation_zmq_port = config.reservation_port
+        self._consumer_pool_capacity = config.consumer_pool_size
         self._consumer_pool: torch.Tensor | None = None
         self._consumer_pool_allocator: _ContiguousAllocator | None = None
         # The receive pool is orders of magnitude larger than the encoder
@@ -655,14 +625,12 @@ class ECMooncakeWorker:
         self._is_receiving_rank = True
         self._tp_rank = 0
         self._tp_size = 1
-        self._consumer_pool_disabled = self._consumer_pool_capacity <= 0
+        self._consumer_pool_disabled = False
         self._consumer_lock = threading.Lock()
         self._push_reservations: dict[str, _PushReservation] = {}
         self._cancelled_transfers: OrderedDict[str, float] = OrderedDict()
         self._control_server: ECMooncakeControlServer | None = None
-        self._consumer_metrics_log_interval = float(
-            self._extra.get("consumer_metrics_log_interval", 10)
-        )
+        self._consumer_metrics_log_interval = config.consumer_metrics_log_interval
         self._consumer_metrics_started_at = time.monotonic()
         self._consumer_worker_metrics: Counter[str] = Counter()
         self._active_push_sources: Counter[tuple[str, int]] = Counter()
@@ -676,28 +644,21 @@ class ECMooncakeWorker:
         self._pending_unregister: dict[int, torch.Tensor] = {}
         self._push_source_registrations: dict[int, _PushSourceRegistration] = {}
         self._push_source_registration_lock = threading.Lock()
-        producer_pool = self._extra.get(
-            "producer_buffer_pool_size", self._registered_capacity
-        )
-        self._producer_pool_capacity = int(producer_pool)
+        self._producer_pool_capacity = config.producer_pool_size
         self._producer_pool: torch.Tensor | None = None
         self._producer_pool_allocator: _ContiguousAllocator | None = None
-        self._producer_pool_disabled = self._producer_pool_capacity <= 0
+        self._producer_pool_disabled = False
         self._producer_pool_lock = threading.Lock()
-        transfer_workers = int(self._extra.get("transfer_max_workers", 4))
-        control_workers = int(self._extra.get("control_max_workers", 8))
-        self._transfer_metrics_log_interval = float(
-            self._extra.get("transfer_metrics_log_interval", 10)
-        )
-        self._control_channel = _ControlChannel(
-            int(float(self._extra.get("control_timeout_s", 30)) * 1000)
-        )
+        self._transfer_metrics_log_interval = config.transfer_metrics_log_interval
+        self._control_channel = _ControlChannel(config.control_timeout_ms)
         self._producer_metrics: Counter[str] = Counter()
         self._io_executor = ThreadPoolExecutor(
-            max_workers=transfer_workers, thread_name_prefix="ec-mooncake-transfer"
+            max_workers=config.transfer_workers,
+            thread_name_prefix="ec-mooncake-transfer",
         )
         self._control_executor = ThreadPoolExecutor(
-            max_workers=control_workers, thread_name_prefix="ec-mooncake-control"
+            max_workers=config.control_workers,
+            thread_name_prefix="ec-mooncake-control",
         )
         self._consumer_shard_cache: dict[str, list[str]] = {}
         self._shard_pool: ThreadPoolExecutor | None = None
@@ -771,7 +732,7 @@ class ECMooncakeWorker:
             # Later pipeline stages hold no encoder outputs, so they need
             # neither a receive pool nor a control channel.
             return
-        raw_device = self._ec_cfg.ec_buffer_device
+        raw_device = self._buffer_device
         device_name = (
             raw_device.lower() if isinstance(raw_device, str) and raw_device else "cuda"
         )
@@ -780,7 +741,7 @@ class ECMooncakeWorker:
             raise RuntimeError(
                 "Mooncake push mode requires a registered consumer buffer pool."
             )
-        base_port = self._reservation_zmq_port + self._control_port_offset
+        base_port = self._reservation_zmq_port
         self._control_server = ECMooncakeControlServer(
             "0.0.0.0",
             base_port + self._tp_rank,
@@ -1540,7 +1501,7 @@ class ECMooncakeWorker:
             # want of a reservation and fail the load for everyone.
             return
         self._ensure_engine()
-        raw_buf = self._ec_cfg.ec_buffer_device
+        raw_buf = self._buffer_device
         buf = raw_buf.lower() if isinstance(raw_buf, str) and raw_buf else "cuda"
         if buf == "cuda" and not torch.accelerator.is_available():
             raise RuntimeError(

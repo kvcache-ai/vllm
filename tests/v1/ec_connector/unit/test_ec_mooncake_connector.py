@@ -11,6 +11,7 @@ import socket
 import sys
 import time
 from contextlib import contextmanager
+from dataclasses import FrozenInstanceError
 from multiprocessing.reduction import ForkingPickler
 from types import ModuleType, SimpleNamespace
 from unittest.mock import Mock, patch
@@ -27,11 +28,13 @@ from vllm.distributed.ec_transfer.ec_connector.base import (
 )
 from vllm.distributed.ec_transfer.ec_connector.factory import ECConnectorFactory
 from vllm.distributed.ec_transfer.ec_connector.mooncake import metadata
+from vllm.distributed.ec_transfer.ec_connector.mooncake.config import MooncakeECConfig
 from vllm.distributed.ec_transfer.ec_connector.mooncake.scheduler import (
     ECMooncakeScheduler,
 )
 from vllm.distributed.ec_transfer.ec_connector.mooncake.worker import (
     _LEASE_TTL_SECONDS,
+    ECMooncakeWorker,
     _ConsumerPoolAllocation,
     _ContiguousAllocator,
 )
@@ -222,6 +225,351 @@ class TestContiguousAllocator:
         assert allocator.allocate(1024) == (0, 1024)
 
 
+class TestMooncakeECConfig:
+    def test_defaults_are_an_immutable_snapshot(self, mock_vllm_config_producer):
+        config = MooncakeECConfig.from_vllm_config(
+            mock_vllm_config_producer, ECConnectorRole.SCHEDULER
+        )
+
+        assert config == MooncakeECConfig(
+            is_producer=True,
+            is_consumer=False,
+            protocol="tcp",
+            buffer_device="cuda",
+            reservation_port=None,
+            reservation_addr=None,
+            control_timeout_s=30,
+            push_wait_timeout_s=60,
+            transfer_workers=4,
+            control_workers=8,
+            producer_pool_size=1_000_000_000,
+            consumer_pool_size=1_000_000_000,
+            transfer_metrics_log_interval=10,
+            consumer_metrics_log_interval=10,
+        )
+
+        mock_vllm_config_producer.ec_transfer_config.ec_connector_extra_config[
+            "mooncake_protocol"
+        ] = "rdma"
+        assert config.protocol == "tcp"
+        with pytest.raises(FrozenInstanceError):
+            config.protocol = "rdma"  # type: ignore[misc]
+
+    def test_custom_values_are_normalized(self, mock_vllm_config_consumer):
+        source = mock_vllm_config_consumer
+        source.parallel_config.tensor_parallel_size = 2
+        source.parallel_config.data_parallel_size = 3
+        source.parallel_config.data_parallel_index = 1
+        source.ec_transfer_config.ec_buffer_device = " cpu "
+        source.ec_transfer_config.ec_buffer_size = 2048
+        source.ec_transfer_config.ec_connector_extra_config = {
+            "mooncake_protocol": " tcp ",
+            "reservation_zmq_port": "5000",
+            "control_timeout_s": "1.5",
+            "push_wait_timeout_s": "2.5",
+            "transfer_max_workers": "3",
+            "control_max_workers": "5",
+            "producer_buffer_pool_size": "1024",
+            "consumer_buffer_pool_size": "1536",
+            "transfer_metrics_log_interval": "0",
+            "consumer_metrics_log_interval": "7",
+        }
+
+        config = MooncakeECConfig.from_vllm_config(source, ECConnectorRole.WORKER)
+
+        assert config.reservation_port == 5002
+        assert config.reservation_addr == "tcp://127.0.0.1:5002"
+        assert config.control_timeout_s == 1.5
+        assert config.push_wait_timeout_s == 2.5
+        assert config.transfer_workers == 3
+        assert config.control_workers == 5
+        assert config.producer_pool_size == 1024
+        assert config.consumer_pool_size == 1536
+        assert config.transfer_metrics_log_interval == 0
+        assert config.consumer_metrics_log_interval == 7
+        assert config.buffer_device == "cpu"
+        assert config.protocol == "tcp"
+
+    @pytest.mark.parametrize(
+        ("key", "value"),
+        [
+            ("control_timeout_s", 0),
+            ("push_wait_timeout_s", -1),
+            ("transfer_max_workers", 0),
+            ("control_max_workers", -1),
+            ("producer_buffer_pool_size", 0),
+            ("consumer_buffer_pool_size", -1),
+        ],
+    )
+    @pytest.mark.parametrize(
+        "role", [ECConnectorRole.SCHEDULER, ECConnectorRole.WORKER]
+    )
+    def test_rejects_nonpositive_values(
+        self, mock_vllm_config_producer, key, value, role
+    ):
+        mock_vllm_config_producer.ec_transfer_config.ec_connector_extra_config[key] = (
+            value
+        )
+
+        with pytest.raises(ValueError, match=key):
+            MooncakeECConfig.from_vllm_config(mock_vllm_config_producer, role)
+
+    @pytest.mark.parametrize(
+        "role", [ECConnectorRole.SCHEDULER, ECConnectorRole.WORKER]
+    )
+    def test_rejects_nonpositive_registered_buffer(
+        self, mock_vllm_config_producer, role
+    ):
+        mock_vllm_config_producer.ec_transfer_config.ec_buffer_size = 0
+
+        with pytest.raises(ValueError, match="ec_buffer_size > 0"):
+            MooncakeECConfig.from_vllm_config(mock_vllm_config_producer, role)
+
+    @pytest.mark.parametrize("key", ["control_timeout_s", "push_wait_timeout_s"])
+    @pytest.mark.parametrize("value", [float("nan"), float("inf"), float("-inf"), True])
+    def test_rejects_invalid_timeouts(self, mock_vllm_config_producer, key, value):
+        mock_vllm_config_producer.ec_transfer_config.ec_connector_extra_config[key] = (
+            value
+        )
+
+        with pytest.raises(ValueError, match=key):
+            MooncakeECConfig.from_vllm_config(
+                mock_vllm_config_producer, ECConnectorRole.WORKER
+            )
+
+    @pytest.mark.parametrize(
+        "key",
+        [
+            "reservation_zmq_port",
+            "transfer_max_workers",
+            "control_max_workers",
+            "producer_buffer_pool_size",
+            "consumer_buffer_pool_size",
+        ],
+    )
+    @pytest.mark.parametrize("value", [1.5, True])
+    def test_rejects_noninteger_values(self, mock_vllm_config_producer, key, value):
+        mock_vllm_config_producer.ec_transfer_config.ec_connector_extra_config[key] = (
+            value
+        )
+
+        with pytest.raises(ValueError, match=key):
+            MooncakeECConfig.from_vllm_config(
+                mock_vllm_config_producer, ECConnectorRole.WORKER
+            )
+
+    @pytest.mark.parametrize("value", [1.5, True])
+    def test_rejects_noninteger_registered_buffer(
+        self, mock_vllm_config_producer, value
+    ):
+        mock_vllm_config_producer.ec_transfer_config.ec_buffer_size = value
+
+        with pytest.raises(ValueError, match="ec_buffer_size"):
+            MooncakeECConfig.from_vllm_config(
+                mock_vllm_config_producer, ECConnectorRole.WORKER
+            )
+
+    def test_accepts_integral_float_integer_values(self, mock_vllm_config_producer):
+        source = mock_vllm_config_producer
+        source.ec_transfer_config.ec_buffer_size = 8.0
+        source.ec_transfer_config.ec_connector_extra_config.update(
+            {
+                "reservation_zmq_port": 5000.0,
+                "transfer_max_workers": 2.0,
+                "control_max_workers": 3.0,
+                "producer_buffer_pool_size": 4.0,
+                "consumer_buffer_pool_size": 5.0,
+            }
+        )
+
+        config = MooncakeECConfig.from_vllm_config(source, ECConnectorRole.WORKER)
+
+        assert (
+            config.reservation_port,
+            config.transfer_workers,
+            config.control_workers,
+            config.producer_pool_size,
+            config.consumer_pool_size,
+        ) == (5000, 2, 3, 4, 5)
+
+    @pytest.mark.parametrize(
+        ("key", "value"),
+        [
+            ("mooncake_protocol", ""),
+            ("mooncake_protocol", " "),
+            ("mooncake_protocol", None),
+            ("mooncake_protocol", 1),
+            ("reservation_zmq_addr", ""),
+            ("reservation_zmq_addr", " "),
+            ("reservation_zmq_addr", None),
+            ("reservation_zmq_addr", 1),
+        ],
+    )
+    def test_rejects_invalid_strings(self, mock_vllm_config_producer, key, value):
+        mock_vllm_config_producer.ec_transfer_config.ec_connector_extra_config[key] = (
+            value
+        )
+
+        with pytest.raises(ValueError, match=key):
+            MooncakeECConfig.from_vllm_config(
+                mock_vllm_config_producer, ECConnectorRole.SCHEDULER
+            )
+
+    @pytest.mark.parametrize("buffer_device", [None, "", " \t"])
+    def test_normalizes_default_buffer_device(
+        self, mock_vllm_config_producer, buffer_device
+    ):
+        mock_vllm_config_producer.ec_transfer_config.ec_buffer_device = buffer_device
+
+        config = MooncakeECConfig.from_vllm_config(
+            mock_vllm_config_producer, ECConnectorRole.WORKER
+        )
+
+        assert config.buffer_device == "cuda"
+
+    def test_strips_buffer_device(self, mock_vllm_config_producer):
+        mock_vllm_config_producer.ec_transfer_config.ec_buffer_device = " cuda "
+
+        config = MooncakeECConfig.from_vllm_config(
+            mock_vllm_config_producer, ECConnectorRole.WORKER
+        )
+
+        assert config.buffer_device == "cuda"
+
+    @pytest.mark.parametrize("buffer_device", [1, True])
+    def test_rejects_invalid_buffer_device(
+        self, mock_vllm_config_producer, buffer_device
+    ):
+        mock_vllm_config_producer.ec_transfer_config.ec_buffer_device = buffer_device
+
+        with pytest.raises(ValueError, match="ec_buffer_device"):
+            MooncakeECConfig.from_vllm_config(
+                mock_vllm_config_producer, ECConnectorRole.WORKER
+            )
+
+    @pytest.mark.parametrize(
+        "key", ["transfer_metrics_log_interval", "consumer_metrics_log_interval"]
+    )
+    @pytest.mark.parametrize(
+        "value", [-1, float("nan"), float("inf"), float("-inf"), True, None]
+    )
+    def test_rejects_invalid_metrics_intervals(
+        self, mock_vllm_config_producer, key, value
+    ):
+        mock_vllm_config_producer.ec_transfer_config.ec_connector_extra_config[key] = (
+            value
+        )
+
+        with pytest.raises(ValueError, match=key):
+            MooncakeECConfig.from_vllm_config(
+                mock_vllm_config_producer, ECConnectorRole.WORKER
+            )
+
+    def test_zero_disables_metrics(self, mock_vllm_config_producer):
+        mock_vllm_config_producer.ec_transfer_config.ec_connector_extra_config.update(
+            {
+                "transfer_metrics_log_interval": 0,
+                "consumer_metrics_log_interval": 0,
+            }
+        )
+
+        config = MooncakeECConfig.from_vllm_config(
+            mock_vllm_config_producer, ECConnectorRole.WORKER
+        )
+
+        assert config.transfer_metrics_log_interval == 0
+        assert config.consumer_metrics_log_interval == 0
+
+    def test_submillisecond_control_timeout_uses_one_millisecond(
+        self, mock_vllm_config_producer
+    ):
+        mock_vllm_config_producer.ec_transfer_config.ec_connector_extra_config[
+            "control_timeout_s"
+        ] = 0.0001
+        with (
+            patch_ec_mooncake_deps(),
+            patch(
+                "vllm.distributed.ec_transfer.ec_connector.mooncake."
+                "scheduler._SchedulerControlChannel"
+            ) as scheduler_channel,
+            patch(
+                "vllm.distributed.ec_transfer.ec_connector.mooncake."
+                "worker._ControlChannel"
+            ) as worker_channel,
+        ):
+            scheduler = ECMooncakeConnector(
+                mock_vllm_config_producer, ECConnectorRole.SCHEDULER
+            )
+            worker = ECMooncakeConnector(
+                mock_vllm_config_producer, ECConnectorRole.WORKER
+            )
+            scheduler.shutdown()
+            worker.shutdown()
+
+        scheduler_channel.assert_called_once_with(1)
+        worker_channel.assert_called_once_with(1)
+
+    @pytest.mark.parametrize("timeout", [1e308, sys.float_info.max])
+    def test_rejects_control_timeout_too_large_for_zmq(
+        self, mock_vllm_config_producer, timeout
+    ):
+        mock_vllm_config_producer.ec_transfer_config.ec_connector_extra_config[
+            "control_timeout_s"
+        ] = timeout
+
+        with pytest.raises(ValueError, match="control_timeout_s"):
+            MooncakeECConfig.from_vllm_config(
+                mock_vllm_config_producer, ECConnectorRole.WORKER
+            )
+
+    def test_rejects_pipeline_parallel_producer(self, mock_vllm_config_producer):
+        mock_vllm_config_producer.parallel_config.pipeline_parallel_size = 2
+
+        with pytest.raises(ValueError, match="pipeline parallelism"):
+            MooncakeECConfig.from_vllm_config(
+                mock_vllm_config_producer, ECConnectorRole.SCHEDULER
+            )
+
+    @pytest.mark.parametrize("port", [0, 65536])
+    def test_rejects_out_of_range_base_port(self, mock_vllm_config_consumer, port):
+        mock_vllm_config_consumer.ec_transfer_config.ec_connector_extra_config[
+            "reservation_zmq_port"
+        ] = port
+
+        with pytest.raises(ValueError, match="1..65535"):
+            MooncakeECConfig.from_vllm_config(
+                mock_vllm_config_consumer, ECConnectorRole.SCHEDULER
+            )
+
+    def test_rejects_topology_that_overflows_port_range(
+        self, mock_vllm_config_consumer
+    ):
+        source = mock_vllm_config_consumer
+        source.parallel_config.tensor_parallel_size = 4
+        source.parallel_config.data_parallel_index = 1
+        source.ec_transfer_config.ec_connector_extra_config["reservation_zmq_port"] = (
+            65530
+        )
+
+        with pytest.raises(ValueError, match="ports must be in 1..65535"):
+            MooncakeECConfig.from_vllm_config(source, ECConnectorRole.SCHEDULER)
+
+    def test_consumer_role_requirements_differ_only_by_process_role(
+        self, mock_vllm_config_consumer
+    ):
+        extra = {"reservation_zmq_addr": "tcp://consumer:19019"}
+        mock_vllm_config_consumer.ec_transfer_config.ec_connector_extra_config = extra
+
+        scheduler = MooncakeECConfig.from_vllm_config(
+            mock_vllm_config_consumer, ECConnectorRole.SCHEDULER
+        )
+        assert scheduler.reservation_addr == "tcp://consumer:19019"
+        with pytest.raises(ValueError, match="workers require reservation_zmq_port"):
+            MooncakeECConfig.from_vllm_config(
+                mock_vllm_config_consumer, ECConnectorRole.WORKER
+            )
+
+
 class TestECMooncakeConnectorValidation:
     @pytest.mark.parametrize(
         "role", [ECConnectorRole.SCHEDULER, ECConnectorRole.WORKER]
@@ -356,11 +704,11 @@ class TestECMooncakeConnectorValidation:
         worker = Mock()
         worker.get_finished.return_value = ({"saved"}, {"loaded"})
         worker.build_connector_worker_meta.return_value = "worker-metadata"
-        with patch(
-            "vllm.distributed.ec_transfer.ec_connector."
-            "mooncake_ec_connector.ECMooncakeWorker",
+        with patch.object(
+            ECMooncakeWorker,
+            "from_vllm_config",
             return_value=worker,
-        ) as worker_type:
+        ) as from_vllm_config:
             connector = ECMooncakeConnector(
                 mock_vllm_config_producer, ECConnectorRole.WORKER
             )
@@ -379,7 +727,7 @@ class TestECMooncakeConnectorValidation:
             finally:
                 connector.shutdown()
 
-        worker_type.assert_called_once_with(mock_vllm_config_producer)
+        from_vllm_config.assert_called_once_with(mock_vllm_config_producer)
         worker.start_services.assert_called_once_with()
         worker.start_save_caches.assert_called_once_with(
             metadata, encoder_cache=encoder_cache, marker=1
@@ -406,9 +754,9 @@ class TestECMooncakeConnectorValidation:
             pass
 
         worker = Mock()
-        with patch(
-            "vllm.distributed.ec_transfer.ec_connector."
-            "mooncake_ec_connector.ECMooncakeWorker",
+        with patch.object(
+            ECMooncakeWorker,
+            "from_vllm_config",
             return_value=worker,
         ):
             connector = ECMooncakeConnector(
@@ -468,9 +816,9 @@ class TestECMooncakeConnectorValidation:
     def test_worker_rejects_scheduler_hooks(
         self, mock_vllm_config_producer, method, args, kwargs
     ):
-        with patch(
-            "vllm.distributed.ec_transfer.ec_connector."
-            "mooncake_ec_connector.ECMooncakeWorker",
+        with patch.object(
+            ECMooncakeWorker,
+            "from_vllm_config",
             return_value=Mock(),
         ):
             connector = ECMooncakeConnector(
@@ -500,9 +848,9 @@ class TestECMooncakeConnectorValidation:
                 "from_vllm_config",
                 return_value=scheduler,
             ),
-            patch(
-                "vllm.distributed.ec_transfer.ec_connector."
-                "mooncake_ec_connector.ECMooncakeWorker",
+            patch.object(
+                ECMooncakeWorker,
+                "from_vllm_config",
                 return_value=worker,
             ),
         ):
@@ -648,7 +996,7 @@ class TestECMooncakeSchedulerMetadata:
         mock_vllm_config_consumer.ec_transfer_config.ec_connector_extra_config = {
             "mooncake_protocol": "tcp",
             "reservation_zmq_port": 19019,
-            "push_wait_timeout_s": 0,
+            "push_wait_timeout_s": 0.001,
         }
         request = mock_request_with_3_mm
         request.mm_features = request.mm_features[:1]
@@ -659,13 +1007,21 @@ class TestECMooncakeSchedulerMetadata:
                 mock_vllm_config_consumer, ECConnectorRole.SCHEDULER
             )
             try:
-                with patch.object(scheduler._scheduler, "_drain_push_notifications"):
+                with (
+                    patch.object(scheduler._scheduler, "_drain_push_notifications"),
+                    patch(
+                        "vllm.distributed.ec_transfer.ec_connector."
+                        "mooncake.scheduler.time.monotonic",
+                        side_effect=[10, 10.002, 10.003],
+                    ),
+                ):
                     assert not scheduler.ensure_cache_available(request, 0)
                     assert not scheduler.ensure_cache_available(request, 0)
-                assert scheduler._scheduler._consumer_scheduler_metrics["stalled"] == 1
-                assert mm_hash in scheduler._scheduler._stalled_hashes
-                # The stall is reported once, not once per scheduling pass.
-                with patch.object(scheduler._scheduler, "_drain_push_notifications"):
+                    assert (
+                        scheduler._scheduler._consumer_scheduler_metrics["stalled"] == 1
+                    )
+                    assert mm_hash in scheduler._scheduler._stalled_hashes
+                    # The stall is reported once, not once per scheduling pass.
                     assert not scheduler.ensure_cache_available(request, 0)
                 assert scheduler._scheduler._consumer_scheduler_metrics["stalled"] == 1
             finally:
@@ -1018,7 +1374,7 @@ class TestECMooncakeSchedulerMetadata:
         mock_vllm_config_consumer.ec_transfer_config.ec_connector_extra_config = {
             "mooncake_protocol": "tcp",
             "reservation_zmq_port": 19019,
-            "push_wait_timeout_s": 0,
+            "push_wait_timeout_s": 0.001,
         }
         request = mock_request_with_3_mm
         request.mm_features = request.mm_features[:1]
@@ -1034,7 +1390,13 @@ class TestECMooncakeSchedulerMetadata:
                     patch.object(
                         scheduler._scheduler, "_control_request", return_value=None
                     ),
+                    patch(
+                        "vllm.distributed.ec_transfer.ec_connector."
+                        "mooncake.scheduler.time.monotonic",
+                        side_effect=[10, 10.002],
+                    ),
                 ):
+                    assert not scheduler.ensure_cache_available(request, 0, set())
                     assert not scheduler.ensure_cache_available(request, 0, set())
                 assert scheduler.take_unavailable_requests() == {request.request_id}
                 # Draining clears it: the scheduler acts on each id once.
@@ -1913,9 +2275,6 @@ class TestECMooncakeWorkerTransfer:
         """A pool that cannot be created must not break pushes."""
         port = _find_free_port()
         consumer_cfg = self._push_harness_config(mock_vllm_config_producer, port)
-        mock_vllm_config_producer.ec_transfer_config.ec_connector_extra_config[
-            "producer_buffer_pool_size"
-        ] = 0
         source = torch.randn(4, 16)
         spec = ECMooncakePushSpec(
             mm_hash="hash",
@@ -1934,8 +2293,13 @@ class TestECMooncakeWorkerTransfer:
             consumer.start_worker_services()
             producer.bind_connector_metadata(ECMooncakeConnectorMetadata(pushes=[spec]))
             try:
-                producer.start_save_caches(encoder_cache={"hash": source})
-                _wait_for_worker_io(producer)
+                with patch(
+                    "vllm.distributed.ec_transfer.ec_connector."
+                    "mooncake.worker.torch.empty",
+                    side_effect=torch.OutOfMemoryError,
+                ):
+                    producer.start_save_caches(encoder_cache={"hash": source})
+                    _wait_for_worker_io(producer)
                 engine = producer._worker._engine
                 assert isinstance(engine, CopyingFakeTransferEngine)
                 assert producer._worker._producer_pool is None

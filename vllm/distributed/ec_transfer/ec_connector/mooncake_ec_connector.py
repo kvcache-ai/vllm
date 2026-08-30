@@ -55,7 +55,7 @@ class ECMooncakeConnector(ECConnectorBase):
         if role == ECConnectorRole.SCHEDULER:
             self._scheduler = ECMooncakeScheduler.from_vllm_config(vllm_config)
         elif role == ECConnectorRole.WORKER:
-            self._worker = ECMooncakeWorker(vllm_config)
+            self._worker = ECMooncakeWorker.from_vllm_config(vllm_config)
         else:
             raise ValueError(f"Unknown EC connector role: {role}")
 

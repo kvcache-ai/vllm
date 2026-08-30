@@ -10,19 +10,22 @@ from collections import Counter, OrderedDict, deque
 from collections.abc import Callable, Collection
 from concurrent.futures import Future, ThreadPoolExecutor
 from contextlib import suppress
-from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
 import torch
 import zmq
 
-from vllm.distributed.ec_transfer.ec_connector.base import ECConnectorMetadata
+from vllm.distributed.ec_transfer.ec_connector.base import (
+    ECConnectorMetadata,
+    ECConnectorRole,
+)
 from vllm.distributed.ec_transfer.ec_connector.cpu.common import (
     _get_encoder_cache_hidden_dim,
 )
 from vllm.distributed.ec_transfer.ec_connector.mooncake._availability import (
     ensure_mooncake_available,
 )
+from vllm.distributed.ec_transfer.ec_connector.mooncake.config import MooncakeECConfig
 from vllm.distributed.ec_transfer.ec_connector.mooncake.metadata import (
     ECMooncakeConnectorMetadata,
     ECMooncakeLoadSpec,
@@ -89,62 +92,17 @@ class _SchedulerControlChannel:
         self._context.destroy(linger=0)
 
 
-@dataclass(frozen=True)
-class ECMooncakeSchedulerConfig:
-    is_producer: bool
-    is_consumer: bool
-    reservation_zmq_addr: str | None
-    consumer_pool_capacity: int
-    push_wait_timeout: float
-    consumer_metrics_log_interval: float
-    encoder_cache_hidden_dim: int | None
-
-
 class ECMooncakeScheduler:
     @classmethod
     def from_vllm_config(cls, vllm_config: VllmConfig) -> ECMooncakeScheduler:
         ensure_mooncake_available()
-        parallel_config = vllm_config.parallel_config
-        ec_cfg = vllm_config.ec_transfer_config
-        assert ec_cfg is not None
-        if ec_cfg.is_ec_producer:
-            if parallel_config.tensor_parallel_size > 1:
-                raise ValueError(
-                    "ECMooncakeConnector producers require tensor_parallel_size=1."
-                )
-            if parallel_config.pipeline_parallel_size > 1:
-                raise ValueError(
-                    "ECMooncakeConnector producers do not support pipeline parallelism."
-                )
-            if parallel_config.data_parallel_size > 1:
-                raise ValueError(
-                    "ECMooncakeConnector producers require data_parallel_size=1."
-                )
-
-        registered_capacity = int(ec_cfg.ec_buffer_size)
-        if registered_capacity <= 0:
-            raise ValueError("ECMooncakeConnector requires ec_buffer_size > 0.")
-
-        extra = ec_cfg.ec_connector_extra_config
-        control_port_offset = (
-            parallel_config.data_parallel_index * parallel_config.tensor_parallel_size
+        config = MooncakeECConfig.from_vllm_config(
+            vllm_config, ECConnectorRole.SCHEDULER
         )
-        reservation_port = extra.get("reservation_zmq_port")
-        reservation_zmq_addr: str | None = extra.get("reservation_zmq_addr")
-        if reservation_zmq_addr is None and reservation_port is not None:
-            base = int(reservation_port) + control_port_offset
-            reservation_zmq_addr = f"tcp://127.0.0.1:{base}"
-        if ec_cfg.is_ec_consumer and not reservation_zmq_addr:
-            raise ValueError(
-                "ec_consumer with ECMooncakeConnector requires "
-                "reservation_zmq_port or reservation_zmq_addr."
-            )
 
-        control_channel = _SchedulerControlChannel(
-            int(float(extra.get("control_timeout_s", 30)) * 1000)
-        )
+        control_channel = _SchedulerControlChannel(config.control_timeout_ms)
         control_executor = ThreadPoolExecutor(
-            max_workers=int(extra.get("control_max_workers", 8)),
+            max_workers=config.control_workers,
             thread_name_prefix="ec-mooncake-control",
         )
 
@@ -153,24 +111,11 @@ class ECMooncakeScheduler:
             control_channel.close()
 
         encoder_cache_hidden_dim = (
-            _get_encoder_cache_hidden_dim(vllm_config)
-            if ec_cfg.is_ec_producer
-            else None
+            _get_encoder_cache_hidden_dim(vllm_config) if config.is_producer else None
         )
         return cls(
-            ECMooncakeSchedulerConfig(
-                is_producer=ec_cfg.is_ec_producer,
-                is_consumer=ec_cfg.is_ec_consumer,
-                reservation_zmq_addr=reservation_zmq_addr,
-                consumer_pool_capacity=int(
-                    extra.get("consumer_buffer_pool_size", registered_capacity)
-                ),
-                push_wait_timeout=float(extra.get("push_wait_timeout_s", 60)),
-                consumer_metrics_log_interval=float(
-                    extra.get("consumer_metrics_log_interval", 10)
-                ),
-                encoder_cache_hidden_dim=encoder_cache_hidden_dim,
-            ),
+            config,
+            encoder_cache_hidden_dim,
             model_config=vllm_config.model_config,
             control_request=control_channel.request,
             submit_control=control_executor.submit,
@@ -179,7 +124,8 @@ class ECMooncakeScheduler:
 
     def __init__(
         self,
-        config: ECMooncakeSchedulerConfig,
+        config: MooncakeECConfig,
+        encoder_cache_hidden_dim: int | None,
         model_config: ModelConfig,
         control_request: Callable[[str, dict[str, Any]], Any],
         submit_control: Callable[..., Future[Any]],
@@ -187,11 +133,11 @@ class ECMooncakeScheduler:
     ) -> None:
         self._is_producer = config.is_producer
         self._is_consumer = config.is_consumer
-        self._reservation_zmq_addr = config.reservation_zmq_addr
-        self._consumer_pool_capacity = config.consumer_pool_capacity
-        self._push_wait_timeout = config.push_wait_timeout
+        self._reservation_zmq_addr = config.reservation_addr
+        self._consumer_pool_capacity = config.consumer_pool_size
+        self._push_wait_timeout = config.push_wait_timeout_s
         self._consumer_metrics_log_interval = config.consumer_metrics_log_interval
-        self._encoder_cache_hidden_dim = config.encoder_cache_hidden_dim
+        self._encoder_cache_hidden_dim = encoder_cache_hidden_dim
         self._model_config = model_config
         self._control_request = control_request
         self._submit_control = submit_control
