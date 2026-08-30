@@ -41,6 +41,9 @@ from vllm.distributed.ec_transfer.ec_connector.mooncake.metadata import (
     ECMooncakePushSpec,
     ECMooncakeWorkerMetadata,
 )
+from vllm.distributed.ec_transfer.ec_connector.mooncake.transfer import (
+    MooncakeTransfer,
+)
 from vllm.logger import init_logger
 from vllm.utils.network_utils import get_ip
 
@@ -57,18 +60,6 @@ _RESERVATION_REFRESH_SECONDS = _LEASE_TTL_SECONDS / 2
 # worker refuses to reserve it again. The count is a backstop for a rate that
 # outruns that TTL; the race it guards is a single drain interval wide.
 _MAX_CANCELLED_TRANSFER_IDS = 1 << 16
-
-try:
-    from mooncake.engine import TransferEngine
-except ImportError:
-    TransferEngine = None  # type: ignore[misc, assignment]
-
-
-@dataclass
-class _PushSourceRegistration:
-    tensor: torch.Tensor
-    nbytes: int
-    users: int = 1
 
 
 @dataclass
@@ -353,7 +344,6 @@ class ECMooncakeWorker:
     ) -> None:
         self.is_producer = config.is_producer
         self.is_consumer = config.is_consumer
-        self._protocol = config.protocol
         self._buffer_device = config.buffer_device
         self._reservation_zmq_port = config.reservation_port
         self._consumer_pool_capacity = config.consumer_pool_size
@@ -386,13 +376,7 @@ class ECMooncakeWorker:
         self._active_push_sources_lock = threading.Lock()
 
         # Worker producer
-        self._engine: TransferEngine | None = None
-        self._engine_lock = threading.Lock()
-        self._hostname = hostname
-        # Published encoder outputs, referenced while a pull is reading them.
-        self._pending_unregister: dict[int, torch.Tensor] = {}
-        self._push_source_registrations: dict[int, _PushSourceRegistration] = {}
-        self._push_source_registration_lock = threading.Lock()
+        self._transfer = MooncakeTransfer(hostname, config.protocol)
         self._producer_pool_capacity = config.producer_pool_size
         self._producer_pool: torch.Tensor | None = None
         self._producer_pool_allocator: _ContiguousAllocator | None = None
@@ -424,24 +408,6 @@ class ECMooncakeWorker:
         self._completed_loads: set[str] = set()
         self._failed_loads: set[str] = set()
         self._shutdown = False
-
-    def _ensure_engine(self) -> TransferEngine:
-        if self._engine is not None:
-            return self._engine
-        with self._engine_lock:
-            if self._engine is not None:
-                return self._engine
-            eng = TransferEngine()
-            ret = eng.initialize(self._hostname, "P2PHANDSHAKE", self._protocol, "")
-            if ret != 0:
-                raise RuntimeError("Mooncake TransferEngine initialization failed.")
-            self._engine = eng
-            logger.info(
-                "ECMooncakeConnector TransferEngine ready at %s:%d",
-                self._hostname,
-                eng.get_rpc_port(),
-            )
-        return self._engine
 
     def _resolve_consumer_rank(self) -> None:
         """Place this worker in the consumer's receive topology.
@@ -510,114 +476,6 @@ class ECMooncakeWorker:
             self._control_server = None
             raise
 
-    def _unregister_memory(self, tensor: torch.Tensor) -> bool:
-        assert self._engine is not None
-        ret = self._engine.unregister_memory(tensor.data_ptr())
-        if ret != 0:
-            logger.error(
-                "Mooncake EC memory unregistration failed for address %d: %d",
-                tensor.data_ptr(),
-                ret,
-            )
-            self._pending_unregister[tensor.data_ptr()] = tensor
-            return False
-        self._pending_unregister.pop(tensor.data_ptr(), None)
-        return True
-
-    def _unregister_memories(self, tensors: list[torch.Tensor]) -> None:
-        assert self._engine is not None
-        addresses = [tensor.data_ptr() for tensor in tensors]
-        ret = self._engine.batch_unregister_memory(addresses)
-        if ret != 0:
-            for tensor in tensors:
-                self._pending_unregister[tensor.data_ptr()] = tensor
-            logger.warning(
-                "Keeping %d EC tensors alive after Mooncake unregistration failure",
-                len(tensors),
-            )
-            return
-        for address in addresses:
-            self._pending_unregister.pop(address, None)
-
-    @staticmethod
-    def _push_source_range(tensor: torch.Tensor) -> tuple[int, int]:
-        # Register exactly the bytes that will be transferred. One encoder
-        # batch returns its items as views of a single storage (models split
-        # the batched embeddings, e.g. `image_embeds.split(sizes)`), so
-        # registering the whole storage would overlap the per-tensor
-        # registration a sibling item takes -- and Mooncake rejects
-        # overlapping memory regions.
-        return tensor.data_ptr(), tensor.nbytes
-
-    def _acquire_push_source_registrations(
-        self, tensors: list[torch.Tensor]
-    ) -> list[int]:
-        ranges: dict[int, tuple[int, torch.Tensor]] = {}
-        for tensor in tensors:
-            address, nbytes = self._push_source_range(tensor)
-            ranges.setdefault(address, (nbytes, tensor))
-
-        eng = self._ensure_engine()
-        acquired: list[int] = []
-        new_addresses: list[int] = []
-        new_lengths: list[int] = []
-        with self._push_source_registration_lock:
-            for address, (nbytes, tensor) in ranges.items():
-                entry = self._push_source_registrations.get(address)
-                if entry is not None:
-                    if entry.nbytes != nbytes:
-                        raise RuntimeError(
-                            "Mooncake EC source storage changed size while registered"
-                        )
-                    entry.users += 1
-                    acquired.append(address)
-                    continue
-                new_addresses.append(address)
-                new_lengths.append(nbytes)
-                self._push_source_registrations[address] = _PushSourceRegistration(
-                    tensor=tensor,
-                    nbytes=nbytes,
-                )
-                acquired.append(address)
-
-            if new_addresses:
-                ret = eng.batch_register_memory(new_addresses, new_lengths)
-                if ret != 0:
-                    for address in acquired:
-                        entry = self._push_source_registrations[address]
-                        entry.users -= 1
-                        if entry.users == 0:
-                            del self._push_source_registrations[address]
-                    raise RuntimeError("Mooncake EC source registration failed")
-        return acquired
-
-    def _release_push_source_registrations(self, addresses: list[int]) -> bool:
-        if not addresses:
-            return True
-        with self._push_source_registration_lock:
-            unused = []
-            for address in addresses:
-                entry = self._push_source_registrations.get(address)
-                if entry is None:
-                    continue
-                entry.users -= 1
-                if entry.users == 0:
-                    unused.append(address)
-            if not unused:
-                return True
-            ret = self._ensure_engine().batch_unregister_memory(unused)
-            if ret != 0:
-                logger.warning(
-                    "Keeping %d EC source tensors registered after Mooncake "
-                    "unregistration failure",
-                    len(unused),
-                )
-                return False
-            for address in unused:
-                del self._push_source_registrations[address]
-                self._pending_unregister.pop(address, None)
-            return True
-
     def _ensure_consumer_pool(
         self, device: torch.device, *, allow_host: bool = False
     ) -> None:
@@ -634,9 +492,7 @@ class ECMooncakeWorker:
             if self._is_receiving_rank:
                 # Producers write into this pool directly, so it needs a memory
                 # region. Later pipeline stages never receive and skip it.
-                ret = self._ensure_engine().batch_register_memory(
-                    [pool.data_ptr()], [pool.nbytes]
-                )
+                ret = self._transfer.register_memory(pool)
                 if ret != 0:
                     raise RuntimeError(f"Mooncake returned {ret}")
         except (RuntimeError, torch.OutOfMemoryError) as e:
@@ -671,9 +527,7 @@ class ECMooncakeWorker:
                 pool = torch.empty(
                     self._producer_pool_capacity, dtype=torch.uint8, device=device
                 )
-                ret = self._ensure_engine().batch_register_memory(
-                    [pool.data_ptr()], [pool.nbytes]
-                )
+                ret = self._transfer.register_memory(pool)
                 if ret != 0:
                     raise RuntimeError(f"Mooncake returned {ret}")
             except (RuntimeError, torch.OutOfMemoryError) as e:
@@ -1018,10 +872,9 @@ class ECMooncakeWorker:
                     self._consumer_worker_metrics["reservations_created"] += 1
                 self._push_reservations[transfer_id] = reservation
 
-        eng = self._ensure_engine()
         return {
             "reservation_id": reservation.reservation_id,
-            "dst_session": f"{self._hostname}:{eng.get_rpc_port()}",
+            "dst_session": self._transfer.local_session(),
             "dst_ptr": reservation.allocation.tensor.data_ptr(),
             "nbytes": reservation.allocation.tensor.nbytes,
             "write": should_write,
@@ -1223,7 +1076,7 @@ class ECMooncakeWorker:
             # multimodal embeddings. Taking a transfer here would fail for
             # want of a reservation and fail the load for everyone.
             return
-        self._ensure_engine()
+        self._transfer.ensure_ready()
         raw_buf = self._buffer_device
         buf = raw_buf.lower() if isinstance(raw_buf, str) and raw_buf else "cuda"
         if buf == "cuda" and not torch.accelerator.is_available():
@@ -1322,7 +1175,6 @@ class ECMooncakeWorker:
                 return
 
             if ready:
-                eng = self._ensure_engine()
                 # One source per push: a sharded consumer reads the same bytes
                 # into each of its ranks, so staging and registration happen
                 # once however many destinations there are.
@@ -1348,9 +1200,7 @@ class ECMooncakeWorker:
                         ).synchronize()
                 else:
                     sources = tensors
-                    registered_sources = self._acquire_push_source_registrations(
-                        tensors
-                    )
+                    registered_sources = self._transfer.acquire_sources(tensors)
                 addresses = [tensor.data_ptr() for tensor in sources]
                 stage_ms["register"] = (time.monotonic() - stage_started_at) * 1000
                 try:
@@ -1362,17 +1212,12 @@ class ECMooncakeWorker:
                     stage_started_at = time.monotonic()
 
                     def write(session: str, items: list[tuple[int, int]]) -> None:
-                        ret = eng.batch_transfer_sync_write(
+                        self._transfer.write(
                             session,
                             [addresses[index] for index, _ in items],
                             [dst for _, dst in items],
                             [lengths[index] for index, _ in items],
                         )
-                        if ret != 0:
-                            raise RuntimeError(
-                                f"Mooncake EC push to {session} failed with "
-                                f"status {ret}"
-                            )
 
                     sessions = list(by_session.items())
                     # Shards are written concurrently: serialising them would
@@ -1391,7 +1236,7 @@ class ECMooncakeWorker:
                 finally:
                     stage_started_at = time.monotonic()
                     self._release_push_staging(staged_regions)
-                    self._release_push_source_registrations(registered_sources)
+                    self._transfer.release_sources(registered_sources)
                     stage_ms["unregister"] = (
                         time.monotonic() - stage_started_at
                     ) * 1000
@@ -1721,33 +1566,15 @@ class ECMooncakeWorker:
         self._control_client.close()
         if self._control_server is not None:
             self._control_server.close()
-        if self._engine is not None:
-            if self._consumer_pool is not None and self._unregister_memory(
-                self._consumer_pool
-            ):
-                self._consumer_pool = None
-                self._consumer_pool_allocator = None
-                self._consumer_residents.clear()
-                self._consumer_retire_events.clear()
-                self._consumer_pending_frees.clear()
-            # Published tensors and in-flight push sources share one refcounted
-            # registration table, so a single pass covers both.
-            with self._push_source_registration_lock:
-                addresses = list(self._push_source_registrations)
-                addresses.extend(self._pending_unregister)
-                unregistered = True
-                if addresses:
-                    ret = self._engine.batch_unregister_memory(
-                        list(dict.fromkeys(addresses))
-                    )
-                    if ret != 0:
-                        unregistered = False
-                        logger.error(
-                            "Mooncake EC batch memory unregistration failed: %d", ret
-                        )
-                if unregistered:
-                    self._push_source_registrations.clear()
-                    self._pending_unregister.clear()
+        if self._consumer_pool is not None and self._transfer.unregister_memory(
+            self._consumer_pool
+        ):
+            self._consumer_pool = None
+            self._consumer_pool_allocator = None
+            self._consumer_residents.clear()
+            self._consumer_retire_events.clear()
+            self._consumer_pending_frees.clear()
+        self._transfer.close()
 
     def __del__(self) -> None:
         with suppress(Exception):

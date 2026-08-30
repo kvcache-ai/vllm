@@ -6,11 +6,13 @@ from __future__ import annotations
 
 import copy
 import ctypes
+import gc
 import importlib
 import socket
 import sys
 import threading
 import time
+import weakref
 from contextlib import contextmanager
 from dataclasses import FrozenInstanceError
 from multiprocessing.reduction import ForkingPickler
@@ -28,7 +30,11 @@ from vllm.distributed.ec_transfer.ec_connector.base import (
     ECConnectorRole,
 )
 from vllm.distributed.ec_transfer.ec_connector.factory import ECConnectorFactory
-from vllm.distributed.ec_transfer.ec_connector.mooncake import control, metadata
+from vllm.distributed.ec_transfer.ec_connector.mooncake import (
+    control,
+    metadata,
+    transfer,
+)
 from vllm.distributed.ec_transfer.ec_connector.mooncake.config import MooncakeECConfig
 from vllm.distributed.ec_transfer.ec_connector.mooncake.control import (
     ConsumerControlServer,
@@ -39,6 +45,9 @@ from vllm.distributed.ec_transfer.ec_connector.mooncake.control import (
 )
 from vllm.distributed.ec_transfer.ec_connector.mooncake.scheduler import (
     ECMooncakeScheduler,
+)
+from vllm.distributed.ec_transfer.ec_connector.mooncake.transfer import (
+    MooncakeTransfer,
 )
 from vllm.distributed.ec_transfer.ec_connector.mooncake.worker import (
     _LEASE_TTL_SECONDS,
@@ -66,8 +75,13 @@ class CopyingFakeTransferEngine:
         self.unregister_calls: list[int] = []
         self.batch_unregister_calls: list[list[int]] = []
         self.transfer_calls: list[list[int]] = []
+        self.transfer_batches: list[tuple[str, list[int], list[int], list[int]]] = []
+        self.initialize_calls: list[tuple[str, str, str, str]] = []
 
     def initialize(self, local_hostname, metadata_server, protocol, device_name) -> int:
+        self.initialize_calls.append(
+            (local_hostname, metadata_server, protocol, device_name)
+        )
         return 0
 
     def get_rpc_port(self) -> int:
@@ -76,8 +90,14 @@ class CopyingFakeTransferEngine:
     def batch_transfer_sync_write(
         self, target_hostname, buffers, peer_buffer_addresses, lengths
     ) -> int:
-        self.transfer_calls.append([int(length) for length in lengths])
-        for src, dst, nbytes in zip(buffers, peer_buffer_addresses, lengths):
+        sources = [int(address) for address in buffers]
+        destinations = [int(address) for address in peer_buffer_addresses]
+        sizes = [int(length) for length in lengths]
+        self.transfer_calls.append(sizes)
+        self.transfer_batches.append(
+            (str(target_hostname), sources, destinations, sizes)
+        )
+        for src, dst, nbytes in zip(sources, destinations, sizes):
             ctypes.memmove(int(dst), int(src), int(nbytes))
         return 0
 
@@ -417,7 +437,7 @@ def mock_vllm_config_consumer():
 def patch_ec_mooncake_deps():
     with (
         patch(
-            "vllm.distributed.ec_transfer.ec_connector.mooncake.worker.TransferEngine",
+            "vllm.distributed.ec_transfer.ec_connector.mooncake.transfer.TransferEngine",
             CopyingFakeTransferEngine,
         ),
         patch(
@@ -431,6 +451,140 @@ def patch_ec_mooncake_deps():
         ),
     ):
         yield
+
+
+class TestMooncakeTransfer:
+    def test_initializes_engine_once_on_first_use(self):
+        engine = CopyingFakeTransferEngine()
+        with patch.object(
+            transfer, "TransferEngine", return_value=engine
+        ) as engine_cls:
+            data_plane = MooncakeTransfer("host", "tcp")
+            assert engine_cls.call_count == 0
+
+            assert data_plane.local_session() == "host:12345"
+            data_plane.ensure_ready()
+
+            engine_cls.assert_called_once_with()
+            assert engine.initialize_calls == [("host", "P2PHANDSHAKE", "tcp", "")]
+            data_plane.close()
+
+    def test_source_registration_is_refcounted_and_failed_release_keeps_owner(self):
+        engine = CopyingFakeTransferEngine()
+        data_plane = MooncakeTransfer("host", "tcp")
+        source = torch.randn(4, 4)
+        source_ref = weakref.ref(source)
+        with patch.object(transfer, "TransferEngine", return_value=engine):
+            first = data_plane.acquire_sources([source])
+            second = data_plane.acquire_sources([source])
+            assert engine.register_calls == [[source.data_ptr()]]
+
+            assert data_plane.release_sources(first)
+            assert engine.batch_unregister_calls == []
+            with patch.object(
+                engine, "batch_unregister_memory", return_value=1
+            ) as unregister:
+                assert not data_plane.release_sources(second)
+                unregister.assert_called_once_with(second)
+
+            del source
+            gc.collect()
+            assert source_ref() is not None
+            with patch.object(
+                engine, "batch_unregister_memory", return_value=0
+            ) as unregister:
+                data_plane.close()
+                data_plane.close()
+                unregister.assert_called_once_with(second)
+            gc.collect()
+            assert source_ref() is None
+
+    def test_failed_destination_unregister_is_retried_on_close(self):
+        engine = CopyingFakeTransferEngine()
+        data_plane = MooncakeTransfer("host", "tcp")
+        destination = torch.zeros(4, 4)
+        destination_ref = weakref.ref(destination)
+        with patch.object(transfer, "TransferEngine", return_value=engine):
+            assert data_plane.register_memory(destination) == 0
+            with patch.object(engine, "unregister_memory", return_value=2):
+                assert not data_plane.unregister_memory(destination)
+            del destination
+            gc.collect()
+            assert destination_ref() is not None
+
+            with patch.object(
+                engine, "batch_unregister_memory", return_value=0
+            ) as unregister:
+                data_plane.close()
+                unregister.assert_called_once()
+            gc.collect()
+            assert destination_ref() is None
+
+    def test_write_preserves_segments_and_reports_terminal_failure(self):
+        engine = CopyingFakeTransferEngine()
+        data_plane = MooncakeTransfer("host", "tcp")
+        sources = [torch.tensor([1, 2]), torch.tensor([3, 4])]
+        destinations = [torch.zeros_like(source) for source in sources]
+        source_addresses = [source.data_ptr() for source in sources]
+        destination_addresses = [tensor.data_ptr() for tensor in destinations]
+        lengths = [source.nbytes for source in sources]
+        with patch.object(transfer, "TransferEngine", return_value=engine):
+            data_plane.write("peer:1", source_addresses, destination_addresses, lengths)
+            assert engine.transfer_batches == [
+                ("peer:1", source_addresses, destination_addresses, lengths)
+            ]
+            assert all(
+                torch.equal(source, destination)
+                for source, destination in zip(sources, destinations)
+            )
+
+            with (
+                patch.object(engine, "batch_transfer_sync_write", return_value=9),
+                pytest.raises(RuntimeError, match="peer:2 failed with status 9"),
+            ):
+                data_plane.write(
+                    "peer:2", source_addresses, destination_addresses, lengths
+                )
+            data_plane.close()
+
+    def test_write_returns_only_after_sync_engine_call_finishes(self):
+        engine = CopyingFakeTransferEngine()
+        data_plane = MooncakeTransfer("host", "tcp")
+        source = torch.ones(1, dtype=torch.uint8)
+        entered = threading.Event()
+        finish = threading.Event()
+
+        def blocking_write(*args):
+            entered.set()
+            assert finish.wait(timeout=2)
+            return 0
+
+        with (
+            patch.object(transfer, "TransferEngine", return_value=engine),
+            patch.object(
+                engine, "batch_transfer_sync_write", side_effect=blocking_write
+            ),
+        ):
+            addresses = data_plane.acquire_sources([source])
+            completed = threading.Event()
+
+            def write():
+                try:
+                    data_plane.write("peer:1", addresses, [2], [source.nbytes])
+                finally:
+                    data_plane.release_sources(addresses)
+                    completed.set()
+
+            thread = threading.Thread(target=write)
+            thread.start()
+            assert entered.wait(timeout=2)
+            assert not completed.is_set()
+            assert engine.batch_unregister_calls == []
+            finish.set()
+            thread.join(timeout=2)
+            assert completed.is_set()
+            assert engine.batch_unregister_calls == [addresses]
+            data_plane.close()
 
 
 class TestECMooncakeFactory:
@@ -2079,7 +2233,7 @@ class TestECMooncakeWorkerTransfer:
                 producer.start_save_caches(encoder_cache=sources)
                 _wait_for_worker_io(producer)
 
-                engine = producer._worker._engine
+                engine = producer._worker._transfer._engine
                 assert isinstance(engine, CopyingFakeTransferEngine)
                 assert len(engine.transfer_calls) == 1
                 assert sorted(engine.transfer_calls[0]) == sorted(
@@ -2177,7 +2331,7 @@ class TestECMooncakeWorkerTransfer:
                 first_meta = consumer.build_connector_worker_meta()
                 assert first_meta.loaded == {"hash"}
                 assert torch.equal(loaded["hash"], source)
-                consumer_engine = consumer._worker._engine
+                consumer_engine = consumer._worker._transfer._engine
                 assert isinstance(consumer_engine, CopyingFakeTransferEngine)
                 assert consumer_engine.transfer_calls == []
             finally:
@@ -2278,7 +2432,7 @@ class TestECMooncakeWorkerTransfer:
                 producer.start_save_caches(encoder_cache={"hash": source})
                 _wait_for_worker_io(producer)
 
-                engine = producer._worker._engine
+                engine = producer._worker._transfer._engine
                 assert isinstance(engine, CopyingFakeTransferEngine)
                 assert engine.transfer_calls == [[source.nbytes]]
                 reservation = consumer._worker._push_reservations["transfer-1"]
@@ -2464,7 +2618,7 @@ class TestECMooncakeWorkerTransfer:
                     producer.start_save_caches(encoder_cache={"hash": source})
                     _wait_for_worker_io(producer)
 
-                engine = producer._worker._engine
+                engine = producer._worker._transfer._engine
                 assert isinstance(engine, CopyingFakeTransferEngine)
                 # One write per rank, and every rank got the same bytes.
                 assert len(engine.transfer_calls) == len(shard_ports)
@@ -2516,7 +2670,7 @@ class TestECMooncakeWorkerTransfer:
                 producer.start_save_caches(encoder_cache={"hash": source})
                 _wait_for_worker_io(producer)
 
-                engine = producer._worker._engine
+                engine = producer._worker._transfer._engine
                 assert isinstance(engine, CopyingFakeTransferEngine)
                 # The staging pool is registered once; a transfer registers
                 # nothing of its own.
@@ -2564,7 +2718,7 @@ class TestECMooncakeWorkerTransfer:
                 ):
                     producer.start_save_caches(encoder_cache={"hash": source})
                     _wait_for_worker_io(producer)
-                engine = producer._worker._engine
+                engine = producer._worker._transfer._engine
                 assert isinstance(engine, CopyingFakeTransferEngine)
                 assert producer._worker._producer_pool is None
                 assert engine.register_calls == [[source.data_ptr()]]
@@ -2586,15 +2740,15 @@ class TestECMooncakeWorkerTransfer:
                 mock_vllm_config_producer, ECConnectorRole.WORKER
             )
             try:
-                first = producer._worker._acquire_push_source_registrations([source])
-                second = producer._worker._acquire_push_source_registrations([source])
-                engine = producer._worker._engine
+                first = producer._worker._transfer.acquire_sources([source])
+                second = producer._worker._transfer.acquire_sources([source])
+                engine = producer._worker._transfer._engine
                 assert isinstance(engine, CopyingFakeTransferEngine)
                 assert len(engine.register_calls) == 1
 
-                producer._worker._release_push_source_registrations(first)
+                producer._worker._transfer.release_sources(first)
                 assert engine.batch_unregister_calls == []
-                producer._worker._release_push_source_registrations(second)
+                producer._worker._transfer.release_sources(second)
                 assert engine.batch_unregister_calls == [first]
             finally:
                 producer.shutdown()
@@ -2683,7 +2837,8 @@ class TestECMooncakeWorkerTransfer:
             consumer.start_worker_services()
             producer.bind_connector_metadata(ECMooncakeConnectorMetadata(pushes=[spec]))
             try:
-                engine = producer._worker._engine or producer._worker._ensure_engine()
+                producer._worker._transfer.ensure_ready()
+                engine = producer._worker._transfer._engine
                 with patch.object(engine, "batch_transfer_sync_write", return_value=1):
                     producer.start_save_caches(encoder_cache={"hash": source})
                     # No raise: the batch reports itself and gives up the
