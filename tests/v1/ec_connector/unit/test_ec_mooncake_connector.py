@@ -21,15 +21,17 @@ from vllm.config import ModelConfig, VllmConfig
 from vllm.distributed.ec_transfer.ec_connector.base import ECConnectorRole
 from vllm.distributed.ec_transfer.ec_connector.factory import ECConnectorFactory
 from vllm.distributed.ec_transfer.ec_connector.mooncake import metadata
-from vllm.distributed.ec_transfer.ec_connector.mooncake_ec_connector import (
+from vllm.distributed.ec_transfer.ec_connector.mooncake.worker import (
     _LEASE_TTL_SECONDS,
+    _ConsumerPoolAllocation,
+    _ContiguousAllocator,
+)
+from vllm.distributed.ec_transfer.ec_connector.mooncake_ec_connector import (
     ECMooncakeConnector,
     ECMooncakeConnectorMetadata,
     ECMooncakeLoadSpec,
     ECMooncakePushSpec,
     ECMooncakeWorkerMetadata,
-    _ConsumerPoolAllocation,
-    _ContiguousAllocator,
 )
 from vllm.v1.core.sched.output import SchedulerOutput
 
@@ -159,15 +161,15 @@ def mock_vllm_config_consumer():
 def patch_ec_mooncake_deps():
     with (
         patch(
-            "vllm.distributed.ec_transfer.ec_connector.mooncake_ec_connector.TransferEngine",
+            "vllm.distributed.ec_transfer.ec_connector.mooncake.worker.TransferEngine",
             CopyingFakeTransferEngine,
         ),
         patch(
-            "vllm.distributed.ec_transfer.ec_connector.mooncake_ec_connector._MOONCAKE_IMPORT_ERROR",
+            "vllm.distributed.ec_transfer.ec_connector.mooncake.worker._MOONCAKE_IMPORT_ERROR",
             None,
         ),
         patch(
-            "vllm.distributed.ec_transfer.ec_connector.mooncake_ec_connector.get_ip",
+            "vllm.distributed.ec_transfer.ec_connector.mooncake.worker.get_ip",
             return_value="127.0.0.1",
         ),
     ):
@@ -243,8 +245,11 @@ class TestECMooncakeConnectorValidation:
             connector = ECMooncakeConnector(cfg, ECConnectorRole.SCHEDULER)
             try:
                 # Replica 2 of a TP=2 consumer starts after two 2-port blocks.
-                assert connector._control_port_offset == 4
-                assert connector._reservation_zmq_addr == "tcp://127.0.0.1:19504"
+                assert connector._scheduler is not None
+                assert (
+                    connector._scheduler._reservation_zmq_addr
+                    == "tcp://127.0.0.1:19504"
+                )
             finally:
                 connector.shutdown()
 
@@ -283,6 +288,47 @@ class TestECMooncakeConnectorValidation:
             try:
                 with pytest.raises(AssertionError):
                     connector.has_cache_item("hash")
+            finally:
+                connector.shutdown()
+
+    def test_worker_hooks_receive_bound_metadata(self, mock_vllm_config_producer):
+        metadata = ECMooncakeConnectorMetadata()
+        worker = Mock()
+        with (
+            patch_ec_mooncake_deps(),
+            patch(
+                "vllm.distributed.ec_transfer.ec_connector."
+                "mooncake_ec_connector.ECMooncakeWorker",
+                return_value=worker,
+            ),
+        ):
+            connector = ECMooncakeConnector(
+                mock_vllm_config_producer, ECConnectorRole.WORKER
+            )
+            connector.bind_connector_metadata(metadata)
+            encoder_cache: dict[str, torch.Tensor] = {}
+
+            connector.start_save_caches(encoder_cache=encoder_cache)
+            connector.start_load_caches(encoder_cache, marker=True)
+            connector.shutdown()
+            connector.shutdown()
+
+        worker.start_save_caches.assert_called_once_with(
+            metadata, encoder_cache=encoder_cache
+        )
+        worker.start_load_caches.assert_called_once_with(
+            metadata, encoder_cache, marker=True
+        )
+        worker.close.assert_called_once_with()
+
+    def test_scheduler_rejects_worker_hook(self, mock_vllm_config_producer):
+        with patch_ec_mooncake_deps():
+            connector = ECMooncakeConnector(
+                mock_vllm_config_producer, ECConnectorRole.SCHEDULER
+            )
+            try:
+                with pytest.raises(AssertionError):
+                    connector.start_worker_services()
             finally:
                 connector.shutdown()
 
@@ -1198,7 +1244,7 @@ class TestECMooncakeWorkerTransfer:
                 producer.start_save_caches(encoder_cache=sources)
                 _wait_for_worker_io(producer)
 
-                engine = producer._engine
+                engine = producer._worker._engine
                 assert isinstance(engine, CopyingFakeTransferEngine)
                 assert len(engine.transfer_calls) == 1
                 assert sorted(engine.transfer_calls[0]) == sorted(
@@ -1206,7 +1252,7 @@ class TestECMooncakeWorkerTransfer:
                 )
                 assert all(
                     reservation.ready
-                    for reservation in consumer._push_reservations.values()
+                    for reservation in consumer._worker._push_reservations.values()
                 )
             finally:
                 producer.shutdown()
@@ -1250,7 +1296,7 @@ class TestECMooncakeWorkerTransfer:
             producer.bind_connector_metadata(ECMooncakeConnectorMetadata(pushes=[push]))
             try:
                 producer.start_save_caches(encoder_cache={})
-                _, reservation = producer._pending_reservations["hash"][0]
+                _, reservation = producer._worker._pending_reservations["hash"][0]
                 shards = reservation.result(timeout=2)
                 # One reservation per consumer shard; this consumer is single.
                 assert len(shards) == 1
@@ -1258,7 +1304,7 @@ class TestECMooncakeWorkerTransfer:
                 assert reservation_data["nbytes"] == source.nbytes
                 old_reservation_id = reservation_data["reservation_id"]
                 reservation_data["_received_at"] -= _LEASE_TTL_SECONDS
-                consumer._push_reservations["transfer-1"].expires_at = 0
+                consumer._worker._push_reservations["transfer-1"].expires_at = 0
                 with patch.object(
                     scheduler._scheduler,
                     "_control_request",
@@ -1272,12 +1318,12 @@ class TestECMooncakeWorkerTransfer:
                         {"op": "peers"},
                         {"op": "event_port"},
                     ]
-                    assert "transfer-1" in consumer._push_reservations
+                    assert "transfer-1" in consumer._worker._push_reservations
 
                     producer.save_caches({"hash": source}, "hash")
                     _wait_for_worker_io(producer)
                     assert (
-                        consumer._push_reservations["transfer-1"].reservation_id
+                        consumer._worker._push_reservations["transfer-1"].reservation_id
                         != old_reservation_id
                     )
                     deadline = time.monotonic() + 2
@@ -1296,7 +1342,7 @@ class TestECMooncakeWorkerTransfer:
                 first_meta = consumer.build_connector_worker_meta()
                 assert first_meta.loaded == {"hash"}
                 assert torch.equal(loaded["hash"], source)
-                consumer_engine = consumer._engine
+                consumer_engine = consumer._worker._engine
                 assert isinstance(consumer_engine, CopyingFakeTransferEngine)
                 assert consumer_engine.transfer_calls == []
             finally:
@@ -1343,14 +1389,14 @@ class TestECMooncakeWorkerTransfer:
             producer.bind_connector_metadata(ECMooncakeConnectorMetadata(pushes=[push]))
             try:
                 producer.start_save_caches(encoder_cache={})
-                _, reservation = producer._pending_reservations["hash"][0]
+                _, reservation = producer._worker._pending_reservations["hash"][0]
                 reservation.result(timeout=2)
-                assert "transfer-1" in consumer._push_reservations
+                assert "transfer-1" in consumer._worker._push_reservations
 
                 producer.get_finished({"request-1"})
                 _wait_for_worker_io(producer)
-                assert "hash" not in producer._pending_reservations
-                assert "transfer-1" not in consumer._push_reservations
+                assert "hash" not in producer._worker._pending_reservations
+                assert "transfer-1" not in consumer._worker._push_reservations
             finally:
                 producer.shutdown()
                 consumer.shutdown()
@@ -1397,13 +1443,19 @@ class TestECMooncakeWorkerTransfer:
                 producer.start_save_caches(encoder_cache={"hash": source})
                 _wait_for_worker_io(producer)
 
-                engine = producer._engine
+                engine = producer._worker._engine
                 assert isinstance(engine, CopyingFakeTransferEngine)
                 assert engine.transfer_calls == [[source.nbytes]]
-                reservation = consumer._push_reservations["transfer-1"]
+                reservation = consumer._worker._push_reservations["transfer-1"]
                 assert reservation.ready
-                assert consumer._consumer_worker_metrics["completions_accepted"] == 1
-                assert consumer._consumer_worker_metrics["completions_repeated"] == 0
+                assert (
+                    consumer._worker._consumer_worker_metrics["completions_accepted"]
+                    == 1
+                )
+                assert (
+                    consumer._worker._consumer_worker_metrics["completions_repeated"]
+                    == 0
+                )
 
                 deadline = time.monotonic() + 2
                 while not scheduler.has_cache_item("hash"):
@@ -1432,9 +1484,12 @@ class TestECMooncakeWorkerTransfer:
                 producer.start_save_caches(encoder_cache={"hash": source})
                 _wait_for_worker_io(producer)
                 assert engine.transfer_calls == [[source.nbytes]]
-                cached = consumer._push_reservations["transfer-2"]
+                cached = consumer._worker._push_reservations["transfer-2"]
                 assert cached.ready and not cached.owns_allocation
-                assert consumer._consumer_worker_metrics["reservations_cached"] == 1
+                assert (
+                    consumer._worker._consumer_worker_metrics["reservations_cached"]
+                    == 1
+                )
 
                 deadline = time.monotonic() + 2
                 while not scheduler.has_cache_item("hash"):
@@ -1449,7 +1504,7 @@ class TestECMooncakeWorkerTransfer:
                 consumer.start_load_caches(loaded)
                 cached_meta = consumer.build_connector_worker_meta()
                 assert cached_meta.loaded == {"hash"}
-                assert "transfer-2" not in consumer._push_reservations
+                assert "transfer-2" not in consumer._worker._push_reservations
                 assert torch.equal(loaded["hash"], source)
             finally:
                 producer.shutdown()
@@ -1491,20 +1546,22 @@ class TestECMooncakeWorkerTransfer:
         with patch_ec_mooncake_deps():
             consumer = ECMooncakeConnector(cfg, ECConnectorRole.WORKER)
             try:
-                consumer._ensure_consumer_pool(torch.device("cpu"), allow_host=True)
-                pool = consumer._consumer_pool
-                allocator = consumer._consumer_pool_allocator
+                consumer._worker._ensure_consumer_pool(
+                    torch.device("cpu"), allow_host=True
+                )
+                pool = consumer._worker._consumer_pool
+                allocator = consumer._worker._consumer_pool_allocator
                 assert pool is not None and allocator is not None
                 offset, size = allocator.allocate(spec.nbytes)
                 tensor = (
                     pool.narrow(0, offset, spec.nbytes).view(torch.float32).view(4, 4)
                 )
                 allocation = _ConsumerPoolAllocation(offset, size, tensor)
-                consumer._consumer_residents.insert("hash", allocation, size)
-                consumer._consumer_residents.retire("hash")
+                consumer._worker._consumer_residents.insert("hash", allocation, size)
+                consumer._worker._consumer_residents.retire("hash")
 
                 # A later push reserves the retired copy instead of transferring.
-                consumer._reserve_push_destination(
+                consumer._worker._reserve_push_destination(
                     {
                         "transfer_id": "t1",
                         "mm_hash": "hash",
@@ -1513,9 +1570,9 @@ class TestECMooncakeWorkerTransfer:
                         "dtype": spec.dtype,
                     }
                 )
-                assert consumer._consumer_residents.num_evictable == 0
+                assert consumer._worker._consumer_residents.num_evictable == 0
 
-                assert consumer._take_resident_tensor(spec) is tensor
+                assert consumer._worker._take_resident_tensor(spec) is tensor
             finally:
                 consumer.shutdown()
 
@@ -1564,11 +1621,15 @@ class TestECMooncakeWorkerTransfer:
             )
             producer.bind_connector_metadata(ECMooncakeConnectorMetadata(pushes=[spec]))
             try:
-                with patch.object(producer, "_send_control", side_effect=fake_send):
+                with patch.object(
+                    producer._worker._control_channel,
+                    "request",
+                    side_effect=fake_send,
+                ):
                     producer.start_save_caches(encoder_cache={"hash": source})
                     _wait_for_worker_io(producer)
 
-                engine = producer._engine
+                engine = producer._worker._engine
                 assert isinstance(engine, CopyingFakeTransferEngine)
                 # One write per rank, and every rank got the same bytes.
                 assert len(engine.transfer_calls) == len(shard_ports)
@@ -1620,18 +1681,18 @@ class TestECMooncakeWorkerTransfer:
                 producer.start_save_caches(encoder_cache={"hash": source})
                 _wait_for_worker_io(producer)
 
-                engine = producer._engine
+                engine = producer._worker._engine
                 assert isinstance(engine, CopyingFakeTransferEngine)
                 # The staging pool is registered once; a transfer registers
                 # nothing of its own.
-                pool = producer._producer_pool
+                pool = producer._worker._producer_pool
                 assert pool is not None
                 assert engine.register_calls == [[pool.data_ptr()]]
                 assert engine.batch_unregister_calls == []
                 assert engine.transfer_calls == [[source.nbytes, source.nbytes]]
                 assert all(
                     reservation.ready
-                    for reservation in consumer._push_reservations.values()
+                    for reservation in consumer._worker._push_reservations.values()
                 )
             finally:
                 producer.shutdown()
@@ -1666,9 +1727,9 @@ class TestECMooncakeWorkerTransfer:
             try:
                 producer.start_save_caches(encoder_cache={"hash": source})
                 _wait_for_worker_io(producer)
-                engine = producer._engine
+                engine = producer._worker._engine
                 assert isinstance(engine, CopyingFakeTransferEngine)
-                assert producer._producer_pool is None
+                assert producer._worker._producer_pool is None
                 assert engine.register_calls == [[source.data_ptr()]]
                 assert engine.batch_unregister_calls == [[source.data_ptr()]]
                 assert engine.transfer_calls == [[source.nbytes]]
@@ -1688,15 +1749,15 @@ class TestECMooncakeWorkerTransfer:
                 mock_vllm_config_producer, ECConnectorRole.WORKER
             )
             try:
-                first = producer._acquire_push_source_registrations([source])
-                second = producer._acquire_push_source_registrations([source])
-                engine = producer._engine
+                first = producer._worker._acquire_push_source_registrations([source])
+                second = producer._worker._acquire_push_source_registrations([source])
+                engine = producer._worker._engine
                 assert isinstance(engine, CopyingFakeTransferEngine)
                 assert len(engine.register_calls) == 1
 
-                producer._release_push_source_registrations(first)
+                producer._worker._release_push_source_registrations(first)
                 assert engine.batch_unregister_calls == []
-                producer._release_push_source_registrations(second)
+                producer._worker._release_push_source_registrations(second)
                 assert engine.batch_unregister_calls == [first]
             finally:
                 producer.shutdown()
@@ -1746,7 +1807,9 @@ class TestECMooncakeWorkerTransfer:
             producer.bind_connector_metadata(ECMooncakeConnectorMetadata(pushes=pushes))
             try:
                 with patch.object(
-                    producer, "_send_control", wraps=producer._send_control
+                    producer._worker._control_channel,
+                    "request",
+                    wraps=producer._worker._control_channel.request,
                 ) as send_control:
                     producer.start_save_caches(encoder_cache=sources)
                     _wait_for_worker_io(producer)
@@ -1755,7 +1818,7 @@ class TestECMooncakeWorkerTransfer:
                 assert "complete" not in ops
                 assert all(
                     reservation.ready
-                    for reservation in consumer._push_reservations.values()
+                    for reservation in consumer._worker._push_reservations.values()
                 )
             finally:
                 producer.shutdown()
@@ -1783,13 +1846,13 @@ class TestECMooncakeWorkerTransfer:
             consumer.start_worker_services()
             producer.bind_connector_metadata(ECMooncakeConnectorMetadata(pushes=[spec]))
             try:
-                engine = producer._engine or producer._ensure_engine()
+                engine = producer._worker._engine or producer._worker._ensure_engine()
                 with patch.object(engine, "batch_transfer_sync_write", return_value=1):
                     producer.start_save_caches(encoder_cache={"hash": source})
                     # No raise: the batch reports itself and gives up the
                     # consumer-side reservation.
                     _wait_for_worker_io(producer)
-                assert "transfer" not in consumer._push_reservations
+                assert "transfer" not in consumer._worker._push_reservations
             finally:
                 producer.shutdown()
                 consumer.shutdown()
@@ -1808,8 +1871,10 @@ class TestECMooncakeWorkerTransfer:
                 mock_vllm_config_consumer, ECConnectorRole.WORKER
             )
             try:
-                consumer._ensure_consumer_pool(torch.device("cpu"), allow_host=True)
-                reservation = consumer._reserve_push_destination(
+                consumer._worker._ensure_consumer_pool(
+                    torch.device("cpu"), allow_host=True
+                )
+                reservation = consumer._worker._reserve_push_destination(
                     {
                         "mm_hash": "hash",
                         "transfer_id": "transfer-1",
@@ -1820,8 +1885,8 @@ class TestECMooncakeWorkerTransfer:
                 )
                 reservation_id = reservation["reservation_id"]
 
-                first = consumer._complete_push("transfer-1", reservation_id)
-                repeated = consumer._complete_push("transfer-1", reservation_id)
+                first = consumer._worker._complete_push("transfer-1", reservation_id)
+                repeated = consumer._worker._complete_push("transfer-1", reservation_id)
 
                 assert first.accepted and first.became_ready
                 assert repeated.accepted and not repeated.became_ready
@@ -1851,18 +1916,22 @@ class TestECMooncakeWorkerTransfer:
                 mock_vllm_config_consumer, ECConnectorRole.WORKER
             )
             try:
-                consumer._ensure_consumer_pool(torch.device("cpu"), allow_host=True)
-                first = consumer._reserve_push_destination(payload("first"))
-                second = consumer._reserve_push_destination(payload("second"))
+                consumer._worker._ensure_consumer_pool(
+                    torch.device("cpu"), allow_host=True
+                )
+                first = consumer._worker._reserve_push_destination(payload("first"))
+                second = consumer._worker._reserve_push_destination(payload("second"))
 
-                consumer._complete_push("first", first["reservation_id"])
-                assert consumer._push_reservations["first"].ready
-                assert not consumer._push_reservations["second"].ready
+                consumer._worker._complete_push("first", first["reservation_id"])
+                assert consumer._worker._push_reservations["first"].ready
+                assert not consumer._worker._push_reservations["second"].ready
 
-                assert consumer._cancel_push("first", first["reservation_id"])
-                assert "first" not in consumer._push_reservations
-                assert "second" in consumer._push_reservations
-                assert consumer._complete_push("second", second["reservation_id"])
+                assert consumer._worker._cancel_push("first", first["reservation_id"])
+                assert "first" not in consumer._worker._push_reservations
+                assert "second" in consumer._worker._push_reservations
+                assert consumer._worker._complete_push(
+                    "second", second["reservation_id"]
+                )
             finally:
                 consumer.shutdown()
 
@@ -1887,16 +1956,20 @@ class TestECMooncakeWorkerTransfer:
                 mock_vllm_config_consumer, ECConnectorRole.WORKER
             )
             try:
-                consumer._ensure_consumer_pool(torch.device("cpu"), allow_host=True)
-                old = consumer._reserve_push_destination(payload)
-                consumer._push_reservations["transfer"].expires_at = 0
-                consumer._expire_push_reservations()
-                new = consumer._reserve_push_destination(payload)
+                consumer._worker._ensure_consumer_pool(
+                    torch.device("cpu"), allow_host=True
+                )
+                old = consumer._worker._reserve_push_destination(payload)
+                consumer._worker._push_reservations["transfer"].expires_at = 0
+                consumer._worker._expire_push_reservations()
+                new = consumer._worker._reserve_push_destination(payload)
 
                 assert old["reservation_id"] != new["reservation_id"]
-                stale = consumer._complete_push("transfer", old["reservation_id"])
+                stale = consumer._worker._complete_push(
+                    "transfer", old["reservation_id"]
+                )
                 assert not stale.accepted
-                assert not consumer._push_reservations["transfer"].ready
+                assert not consumer._worker._push_reservations["transfer"].ready
             finally:
                 consumer.shutdown()
 
@@ -1912,8 +1985,10 @@ class TestECMooncakeWorkerTransfer:
                 mock_vllm_config_consumer, ECConnectorRole.WORKER
             )
             try:
-                consumer._ensure_consumer_pool(torch.device("cpu"), allow_host=True)
-                reservation = consumer._reserve_push_destination(
+                consumer._worker._ensure_consumer_pool(
+                    torch.device("cpu"), allow_host=True
+                )
+                reservation = consumer._worker._reserve_push_destination(
                     {
                         "mm_hash": "hash",
                         "transfer_id": "transfer-1",
@@ -1922,11 +1997,13 @@ class TestECMooncakeWorkerTransfer:
                         "dtype": "float32",
                     }
                 )
-                consumer._complete_push("transfer-1", reservation["reservation_id"])
-                consumer._push_reservations["transfer-1"].expires_at = 0
+                consumer._worker._complete_push(
+                    "transfer-1", reservation["reservation_id"]
+                )
+                consumer._worker._push_reservations["transfer-1"].expires_at = 0
 
-                assert consumer._expire_push_reservations() == 1
-                assert "transfer-1" not in consumer._push_reservations
+                assert consumer._worker._expire_push_reservations() == 1
+                assert "transfer-1" not in consumer._worker._push_reservations
             finally:
                 consumer.shutdown()
 
@@ -1951,15 +2028,17 @@ class TestECMooncakeWorkerTransfer:
                 mock_vllm_config_consumer, ECConnectorRole.WORKER
             )
             try:
-                consumer._ensure_consumer_pool(torch.device("cpu"), allow_host=True)
-                assert consumer._cancel_push("cancelled-transfer", "")
-                cancelled = consumer._reserve_push_destination(payload)
+                consumer._worker._ensure_consumer_pool(
+                    torch.device("cpu"), allow_host=True
+                )
+                assert consumer._worker._cancel_push("cancelled-transfer", "")
+                cancelled = consumer._worker._reserve_push_destination(payload)
                 assert cancelled["cancelled"] and not cancelled["write"]
-                assert "cancelled-transfer" not in consumer._push_reservations
+                assert "cancelled-transfer" not in consumer._worker._push_reservations
 
-                consumer._cancelled_transfers["cancelled-transfer"] = 0
-                consumer._expire_push_reservations()
-                replacement = consumer._reserve_push_destination(payload)
+                consumer._worker._cancelled_transfers["cancelled-transfer"] = 0
+                consumer._worker._expire_push_reservations()
+                replacement = consumer._worker._reserve_push_destination(payload)
                 assert replacement["write"]
             finally:
                 consumer.shutdown()
@@ -1984,16 +2063,23 @@ class TestECMooncakeWorkerTransfer:
                 mock_vllm_config_consumer, ECConnectorRole.WORKER
             )
             try:
-                consumer._ensure_consumer_pool(torch.device("cpu"), allow_host=True)
-                assert consumer._cancel_push("refreshed-transfer", "")
-                assert consumer._cancel_push("stale-transfer", "")
-                consumer._cancelled_transfers["stale-transfer"] = 0.0
-                assert consumer._cancel_push("refreshed-transfer", "")
+                consumer._worker._ensure_consumer_pool(
+                    torch.device("cpu"), allow_host=True
+                )
+                assert consumer._worker._cancel_push("refreshed-transfer", "")
+                assert consumer._worker._cancel_push("stale-transfer", "")
+                consumer._worker._cancelled_transfers["stale-transfer"] = 0.0
+                assert consumer._worker._cancel_push("refreshed-transfer", "")
 
-                consumer._expire_push_reservations()
+                consumer._worker._expire_push_reservations()
 
-                assert list(consumer._cancelled_transfers) == ["refreshed-transfer"]
-                assert consumer._consumer_worker_metrics["cancel_records_dropped"] == 1
+                assert list(consumer._worker._cancelled_transfers) == [
+                    "refreshed-transfer"
+                ]
+                assert (
+                    consumer._worker._consumer_worker_metrics["cancel_records_dropped"]
+                    == 1
+                )
             finally:
                 consumer.shutdown()
 

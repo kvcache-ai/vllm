@@ -53,6 +53,7 @@ class ECMooncakeScheduler:
         model_config: ModelConfig,
         control_request: Callable[[str, dict[str, Any]], Any],
         submit_control: Callable[..., Future[Any]],
+        close_control: Callable[[], None],
     ) -> None:
         self._is_producer = config.is_producer
         self._is_consumer = config.is_consumer
@@ -64,6 +65,7 @@ class ECMooncakeScheduler:
         self._model_config = model_config
         self._control_request = control_request
         self._submit_control = submit_control
+        self._close_control = close_control
 
         self._metadata_fields_cache: dict[str, set[str]] = {}
         self._consumer_metrics_started_at = time.monotonic()
@@ -736,6 +738,7 @@ class ECMooncakeScheduler:
         return False, {"ec_items": items}
 
     def close(self) -> None:
+        self._close_control()
         if self._event_zmq_socket is not None:
             self._event_zmq_socket.close(linger=0)
         if self._event_zmq_ctx is not None:
