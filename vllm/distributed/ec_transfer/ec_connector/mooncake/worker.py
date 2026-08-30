@@ -13,8 +13,7 @@ from __future__ import annotations
 import math
 import threading
 import time
-import uuid
-from collections import Counter, OrderedDict, deque
+from collections import Counter, deque
 from concurrent.futures import Future, ThreadPoolExecutor
 from contextlib import suppress
 from dataclasses import dataclass, field
@@ -37,13 +36,17 @@ from vllm.distributed.ec_transfer.ec_connector.mooncake.memory import (
     ConsumerMemoryPool,
     MemoryAllocation,
     ProducerMemoryPool,
-    ResidentLease,
 )
 from vllm.distributed.ec_transfer.ec_connector.mooncake.metadata import (
     ECMooncakeConnectorMetadata,
     ECMooncakeLoadSpec,
     ECMooncakePushSpec,
     ECMooncakeWorkerMetadata,
+)
+from vllm.distributed.ec_transfer.ec_connector.mooncake.reservation import (
+    CancellationOutcome,
+    ConsumerReservationManager,
+    ConsumerReservationState,
 )
 from vllm.distributed.ec_transfer.ec_connector.mooncake.transfer import (
     MooncakeTransfer,
@@ -58,25 +61,7 @@ if TYPE_CHECKING:
 
 _LEASE_TTL_SECONDS = 300
 _RESERVATION_REFRESH_SECONDS = _LEASE_TTL_SECONDS / 2
-# A cancelled transfer stays on the scheduler's ignore list for as long as the
-# worker refuses to reserve it again. The count is a backstop for a rate that
-# outruns that TTL; the race it guards is a single drain interval wide.
 _MAX_CANCELLED_TRANSFER_IDS = 1 << 16
-
-
-@dataclass
-class _PushReservation:
-    mm_hash: str
-    reservation_id: str
-    allocation: MemoryAllocation
-    shape: tuple[int, ...]
-    dtype: str
-    ready: bool = False
-    owns_allocation: bool = True
-    resident_lease: ResidentLease[MemoryAllocation] | None = None
-    discard_on_complete: bool = False
-    created_at: float = field(default_factory=time.monotonic)
-    expires_at: float = 0
 
 
 @dataclass
@@ -187,12 +172,15 @@ class ECMooncakeWorker:
             config.consumer_pool_size,
             self._transfer,
         )
+        self._reservations = ConsumerReservationManager(
+            self._consumer_memory,
+            _LEASE_TTL_SECONDS,
+            _MAX_CANCELLED_TRANSFER_IDS,
+        )
         self._consumer_rank_resolved = False
         self._is_receiving_rank = True
         self._tp_rank = 0
         self._tp_size = 1
-        self._push_reservations: dict[str, _PushReservation] = {}
-        self._cancelled_transfers: OrderedDict[str, float] = OrderedDict()
         self._control_server: ConsumerControlServer | None = None
         self._consumer_metrics_log_interval = config.consumer_metrics_log_interval
         self._consumer_metrics_started_at = time.monotonic()
@@ -316,25 +304,23 @@ class ECMooncakeWorker:
         ):
             return
         with self._consumer_memory.lock:
+            reservations = self._reservations.active_records()
             ready = [
-                mm_hash
-                for mm_hash, reservation in self._push_reservations.items()
-                if reservation.ready
+                record.mm_hash
+                for record in reservations
+                if record.state is ConsumerReservationState.READY
             ]
             pending = [
-                mm_hash
-                for mm_hash, reservation in self._push_reservations.items()
-                if not reservation.ready
+                record.mm_hash
+                for record in reservations
+                if record.state is not ConsumerReservationState.READY
             ]
             metrics = dict(self._consumer_worker_metrics)
             self._consumer_worker_metrics.clear()
             metrics.update(self._consumer_memory.take_metrics())
             residents, live, retired, pending_frees = self._consumer_memory.stats()
             oldest_reservation_ms = max(
-                (
-                    (now - reservation.created_at) * 1000
-                    for reservation in self._push_reservations.values()
-                ),
+                ((now - reservation.created_at) * 1000 for reservation in reservations),
                 default=0.0,
             )
         logger.info(
@@ -355,54 +341,15 @@ class ECMooncakeWorker:
         )
         self._consumer_metrics_started_at = now
 
-    @staticmethod
-    def _expire_cancel_records(records: OrderedDict[str, float], now: float) -> int:
-        """Drop the cancels that can no longer be told apart from unknown ids.
-
-        Both roles keep one record per multimodal item they handle, and both
-        consult it on a per-item hot path, so a full rescan costs the square
-        of the item rate: at 53 items/s the worker's 300 s window is 16k
-        entries and its sweep ran under the consumer memory lock on every
-        reservation. Callers append in deadline order -- `move_to_end` when
-        refreshing one -- so the front is always the oldest and the sweep
-        stops at the first live entry.
-
-        Returns:
-            How many records were dropped.
-        """
-        dropped = 0
-        while records:
-            expires_at = next(iter(records.values()))
-            if expires_at > now and len(records) <= _MAX_CANCELLED_TRANSFER_IDS:
-                break
-            records.popitem(last=False)
-            dropped += 1
-        return dropped
-
-    def _release_reservation_allocation(self, reservation: _PushReservation) -> None:
-        if reservation.owns_allocation:
-            self._consumer_memory.free(reservation.allocation)
-        elif reservation.resident_lease is not None:
-            self._consumer_memory.release_cached(reservation.resident_lease)
-            reservation.resident_lease = None
-
-    def _expire_push_reservations_locked(self) -> None:
-        now = time.monotonic()
-        for transfer_id, reservation in list(self._push_reservations.items()):
-            if reservation.expires_at > now:
-                continue
-            self._release_reservation_allocation(reservation)
-            self._push_reservations.pop(transfer_id)
-            self._consumer_worker_metrics["reservations_expired"] += 1
-        self._consumer_worker_metrics["cancel_records_dropped"] += (
-            self._expire_cancel_records(self._cancelled_transfers, now)
-        )
-
     def _expire_push_reservations(self) -> int:
-        with self._consumer_memory.lock:
-            before = len(self._push_reservations)
-            self._expire_push_reservations_locked()
-            return before - len(self._push_reservations)
+        return self._record_expiry_metrics(self._reservations.expire())
+
+    def _record_expiry_metrics(self, counts: tuple[int, int, int]) -> int:
+        expired, deferred, tombstones_dropped = counts
+        self._consumer_worker_metrics["reservations_expired"] += expired
+        self._consumer_worker_metrics["cancellations_deferred"] += deferred
+        self._consumer_worker_metrics["cancel_records_dropped"] += tombstones_dropped
+        return expired
 
     def _reserve_push_destination(self, payload: dict[str, Any]) -> dict[str, Any]:
         transfer_id = str(payload["transfer_id"])
@@ -417,81 +364,39 @@ class ECMooncakeWorker:
         if expected_nbytes != nbytes:
             raise ValueError("shape and dtype do not match nbytes")
 
-        with self._consumer_memory.lock:
-            self._expire_push_reservations_locked()
-            if transfer_id in self._cancelled_transfers:
-                self._consumer_worker_metrics["reservations_cancelled_early"] += 1
-                return {
-                    "reservation_id": "",
-                    "dst_session": "",
-                    "dst_ptr": 0,
-                    "nbytes": nbytes,
-                    "write": False,
-                    "ready": False,
-                    "cancelled": True,
-                }
-            existing = self._push_reservations.get(transfer_id)
-            if existing is not None:
-                if (
-                    existing.mm_hash != mm_hash
-                    or existing.shape != shape
-                    or existing.dtype != dtype_name
-                ):
-                    raise ValueError("conflicting reservation for transfer_id")
-                reservation = existing
-                should_write = False
-                key = (
-                    "reservations_reused_ready"
-                    if existing.ready
-                    else ("reservations_reused_pending")
-                )
-                self._consumer_worker_metrics[key] += 1
-                if not existing.ready:
-                    existing.expires_at = time.monotonic() + _LEASE_TTL_SECONDS
-            else:
-                resident_lease = self._consumer_memory.acquire_cached(
-                    mm_hash, shape, dtype
-                )
-                if resident_lease is not None:
-                    reservation = _PushReservation(
-                        mm_hash=mm_hash,
-                        reservation_id=uuid.uuid4().hex,
-                        allocation=resident_lease.value,
-                        shape=shape,
-                        dtype=dtype_name,
-                        ready=True,
-                        owns_allocation=False,
-                        resident_lease=resident_lease,
-                        expires_at=time.monotonic() + _LEASE_TTL_SECONDS,
-                    )
-                    should_write = False
-                    self._consumer_worker_metrics["reservations_cached"] += 1
-                else:
-                    allocation = self._consumer_memory.try_allocate(
-                        nbytes, shape, dtype
-                    )
-                    if allocation is None:
-                        self._expire_push_reservations_locked()
-                        allocation = self._consumer_memory.try_allocate(
-                            nbytes, shape, dtype
-                        )
-                    if allocation is None:
-                        allocation = self._consumer_memory.reclaim_and_allocate(
-                            nbytes, shape, dtype
-                        )
-                    if allocation is None:
-                        raise RuntimeError("EC consumer buffer pool is full")
-                    reservation = _PushReservation(
-                        mm_hash=mm_hash,
-                        reservation_id=uuid.uuid4().hex,
-                        allocation=allocation,
-                        shape=shape,
-                        dtype=dtype_name,
-                        expires_at=time.monotonic() + _LEASE_TTL_SECONDS,
-                    )
-                    should_write = True
-                    self._consumer_worker_metrics["reservations_created"] += 1
-                self._push_reservations[transfer_id] = reservation
+        self._expire_push_reservations()
+        reservation, should_write, reused, expiry_counts = self._reservations.reserve(
+            transfer_id, mm_hash, nbytes, shape, dtype_name, dtype
+        )
+        self._record_expiry_metrics(expiry_counts)
+        if reservation is None:
+            raise RuntimeError("EC consumer buffer pool is full")
+        if reservation.state in {
+            ConsumerReservationState.CANCEL_PENDING,
+            ConsumerReservationState.CANCELLED,
+        }:
+            self._consumer_worker_metrics["reservations_cancelled_early"] += 1
+            return {
+                "reservation_id": "",
+                "dst_session": "",
+                "dst_ptr": 0,
+                "nbytes": nbytes,
+                "write": False,
+                "ready": False,
+                "cancelled": True,
+            }
+        if reused:
+            key = (
+                "reservations_reused_ready"
+                if reservation.state is ConsumerReservationState.READY
+                else "reservations_reused_pending"
+            )
+            self._consumer_worker_metrics[key] += 1
+        elif reservation.lease is not None:
+            self._consumer_worker_metrics["reservations_cached"] += 1
+        else:
+            self._consumer_worker_metrics["reservations_created"] += 1
+        assert reservation.allocation is not None
 
         return {
             "reservation_id": reservation.reservation_id,
@@ -499,97 +404,68 @@ class ECMooncakeWorker:
             "dst_ptr": reservation.allocation.tensor.data_ptr(),
             "nbytes": reservation.allocation.tensor.nbytes,
             "write": should_write,
-            "ready": reservation.ready,
-            "cached": not reservation.owns_allocation,
+            "ready": reservation.state is ConsumerReservationState.READY,
+            "cached": reservation.lease is not None,
         }
 
     def _push_status(self, transfer_id: str) -> dict[str, Any] | None:
-        with self._consumer_memory.lock:
-            reservation = self._push_reservations.get(transfer_id)
-            if reservation is None:
-                return None
-            return {
-                "mm_hash": reservation.mm_hash,
-                "ready": reservation.ready,
-                "reservation_id": reservation.reservation_id,
-                "nbytes": reservation.allocation.tensor.nbytes,
-                "shape": list(reservation.shape),
-                "dtype": reservation.dtype,
-            }
+        reservation = self._reservations.status(transfer_id)
+        if reservation is None:
+            return None
+        assert reservation.allocation is not None
+        return {
+            "mm_hash": reservation.mm_hash,
+            "ready": reservation.state is ConsumerReservationState.READY,
+            "reservation_id": reservation.reservation_id,
+            "nbytes": reservation.allocation.tensor.nbytes,
+            "shape": list(reservation.shape),
+            "dtype": reservation.dtype,
+        }
 
     def _complete_push(
         self, transfer_id: str, reservation_id: str
     ) -> ControlCompletion:
-        with self._consumer_memory.lock:
-            reservation = self._push_reservations.get(transfer_id)
-            if reservation is None or reservation.reservation_id != reservation_id:
-                self._consumer_worker_metrics["completions_rejected"] += 1
-                return ControlCompletion(False)
-            if reservation.ready:
-                self._consumer_worker_metrics["completions_repeated"] += 1
-                return ControlCompletion(True)
+        result = self._reservations.complete(transfer_id, reservation_id)
+        if not result.accepted:
+            self._consumer_worker_metrics["completions_rejected"] += 1
+        elif result.repeated:
+            self._consumer_worker_metrics["completions_repeated"] += 1
+        else:
             self._consumer_worker_metrics["completions_accepted"] += 1
-            if reservation.discard_on_complete:
-                self._push_reservations.pop(transfer_id)
-                self._release_reservation_allocation(reservation)
-                self._consumer_worker_metrics["reservations_discarded"] += 1
-                return ControlCompletion(True)
-            reservation.ready = True
-            reservation.expires_at = time.monotonic() + _LEASE_TTL_SECONDS
-            return ControlCompletion(True, became_ready=True)
+        if result.discarded:
+            self._consumer_worker_metrics["reservations_discarded"] += 1
+        return ControlCompletion(result.accepted, result.became_ready)
 
     def _cancel_push(
-        self, transfer_id: str, reservation_id: str, abandon: bool = False
+        self,
+        transfer_id: str,
+        reservation_id: str,
+        abandon: bool = False,
+        refresh: bool = False,
     ) -> bool:
-        with self._consumer_memory.lock:
-            reservation = self._push_reservations.get(transfer_id)
-            if (
-                reservation is not None
-                and reservation_id
-                and reservation.reservation_id != reservation_id
-            ):
-                self._consumer_worker_metrics["cancellations_rejected"] += 1
-                return False
-            self._cancelled_transfers[transfer_id] = (
-                time.monotonic() + _LEASE_TTL_SECONDS
-            )
-            self._cancelled_transfers.move_to_end(transfer_id)
-            if reservation is None:
-                self._consumer_worker_metrics["cancellations_pre_reserved"] += 1
-                return True
-            if not reservation.ready and not abandon:
-                reservation.discard_on_complete = True
-                self._consumer_worker_metrics["cancellations_deferred"] += 1
-                return True
-            self._push_reservations.pop(transfer_id)
-            self._release_reservation_allocation(reservation)
-            self._consumer_worker_metrics["reservations_cancelled"] += 1
-            return True
+        outcome, tombstones_dropped = self._reservations.cancel(
+            transfer_id, reservation_id, abandon, refresh
+        )
+        metrics = {
+            CancellationOutcome.REJECTED: "cancellations_rejected",
+            CancellationOutcome.PRE_RESERVED: "cancellations_pre_reserved",
+            CancellationOutcome.DEFERRED: "cancellations_deferred",
+            CancellationOutcome.CANCELLED: "reservations_cancelled",
+        }
+        self._consumer_worker_metrics[metrics[outcome]] += 1
+        self._consumer_worker_metrics["cancel_records_dropped"] += tombstones_dropped
+        return outcome is not CancellationOutcome.REJECTED
 
     def _take_pushed_tensor(
         self, spec: ECMooncakeLoadSpec
     ) -> tuple[torch.Tensor, MemoryAllocation]:
-        with self._consumer_memory.lock:
-            reservation = self._push_reservations.get(spec.transfer_id)
-            # Not compared against `spec.reservation_id`: each shard mints its
-            # own, while the spec carries the one from whichever shard's event
-            # the scheduler observed. `transfer_id` is assigned per request
-            # item and is already unique, and a stale reservation for a reused
-            # one is rejected by `_reserve_push_destination`.
-            if reservation is None or not reservation.ready:
-                self._consumer_worker_metrics["takes_rejected"] += 1
-                raise RuntimeError(
-                    f"Pushed EC tensor is not ready for mm_hash={spec.mm_hash}"
-                )
-            self._push_reservations.pop(spec.transfer_id)
-            allocation = self._consumer_memory.publish(
-                spec.mm_hash,
-                reservation.allocation,
-                reservation.resident_lease,
-            )
-            reservation.resident_lease = None
-            self._consumer_worker_metrics["reservations_taken"] += 1
-            return allocation.tensor, allocation
+        try:
+            allocation = self._reservations.take(spec.transfer_id, spec.mm_hash)
+        except RuntimeError:
+            self._consumer_worker_metrics["takes_rejected"] += 1
+            raise
+        self._consumer_worker_metrics["reservations_taken"] += 1
+        return allocation.tensor, allocation
 
     def _shard_executor(self) -> ThreadPoolExecutor:
         """Threads for the extra shards of a sharded consumer.
@@ -638,6 +514,34 @@ class ECMooncakeWorker:
             for addr in shards[1:]
         ]
         return [self._reserve_one(shards[0], spec)] + [f.result() for f in extra]
+
+    def _refresh_remote_reservations(
+        self,
+        spec: ECMooncakePushSpec,
+        reservations: list[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        for shard in reservations:
+            if (
+                shard.get("ready", False)
+                or shard.get("cached", False)
+                or shard.get("cancelled", False)
+            ):
+                continue
+            result = self._control_client.request(
+                str(shard.get("addr", spec.consumer_zmq)),
+                {
+                    "op": "cancel",
+                    "transfer_id": spec.transfer_id,
+                    "reservation_id": str(shard["reservation_id"]),
+                    "abandon": True,
+                    "refresh": True,
+                },
+            )
+            if not isinstance(result, dict) or not result.get("cancelled"):
+                raise RuntimeError(
+                    f"Could not refresh EC reservation for mm_hash={spec.mm_hash}"
+                )
+        return self._reserve_remote(spec)
 
     def _cancel_remote(
         self, consumer_zmq: str, transfer_id: str, reservation_id: str
@@ -697,11 +601,7 @@ class ECMooncakeWorker:
             raise RuntimeError(
                 "ECMooncakeConnector requires CUDA for ec_buffer_device=cuda"
             )
-        with self._consumer_memory.lock:
-            reserved_hashes = {
-                reservation.mm_hash for reservation in self._push_reservations.values()
-            }
-            self._consumer_memory.retire_stale(encoder_cache, reserved_hashes)
+        self._reservations.retire_stale(encoder_cache)
 
         for spec in metadata.loads:
             if spec.mm_hash in encoder_cache:
@@ -768,11 +668,14 @@ class ECMooncakeWorker:
                     index
                     for index, shard in enumerate(reservations)
                     if not shard.get("ready", False)
+                    and not shard.get("cancelled", False)
                     and time.monotonic() - float(shard.get("_received_at", started_at))
                     >= _RESERVATION_REFRESH_SECONDS
                 ]
                 if stale:
-                    reservations = self._reserve_remote(push.spec)
+                    reservations = self._refresh_remote_reservations(
+                        push.spec, reservations
+                    )
                 stage_ms["reserve"] += (time.monotonic() - stage_started_at) * 1000
                 for shard in reservations:
                     if shard.get("cached", False) or shard.get("cancelled", False):

@@ -13,6 +13,7 @@ import sys
 import threading
 import time
 import weakref
+from collections import Counter
 from contextlib import contextmanager
 from dataclasses import FrozenInstanceError
 from multiprocessing.reduction import ForkingPickler
@@ -50,6 +51,11 @@ from vllm.distributed.ec_transfer.ec_connector.mooncake.memory import (
     ContiguousAllocator,
     ProducerMemoryPool,
     ResidentPool,
+)
+from vllm.distributed.ec_transfer.ec_connector.mooncake.reservation import (
+    CancellationOutcome,
+    ConsumerReservationManager,
+    ConsumerReservationState,
 )
 from vllm.distributed.ec_transfer.ec_connector.mooncake.scheduler import (
     ECMooncakeScheduler,
@@ -324,7 +330,7 @@ class TestECMooncakeControlPlane:
     def test_server_preserves_wire_shapes_and_closes_twice(self):
         port = _find_free_port()
         completed: list[tuple[str, str]] = []
-        cancelled: list[tuple[str, str, bool]] = []
+        cancelled: list[tuple[str, str, bool, bool]] = []
 
         def status(transfer_id: str):
             return {"transfer_id": transfer_id, "ready": False}
@@ -333,8 +339,13 @@ class TestECMooncakeControlPlane:
             completed.append((transfer_id, reservation_id))
             return ControlCompletion(True, became_ready=True)
 
-        def cancel(transfer_id: str, reservation_id: str, abandon: bool):
-            cancelled.append((transfer_id, reservation_id, abandon))
+        def cancel(
+            transfer_id: str,
+            reservation_id: str,
+            abandon: bool,
+            refresh: bool,
+        ):
+            cancelled.append((transfer_id, reservation_id, abandon, refresh))
             return True
 
         server = ConsumerControlServer(
@@ -398,7 +409,7 @@ class TestECMooncakeControlPlane:
             server.close()
 
         assert completed == [("transfer", "r0"), ("transfer", "r0")]
-        assert cancelled == [("transfer", "r0", True)]
+        assert cancelled == [("transfer", "r0", True, False)]
 
 
 @pytest.fixture
@@ -2679,15 +2690,449 @@ class TestECMooncakeSchedulerMetadata:
         }
 
 
+class TestConsumerReservationManager:
+    @staticmethod
+    def manager():
+        pool = Mock()
+        pool.lock = threading.RLock()
+        pool.acquire_cached.return_value = None
+        allocation = memory.MemoryAllocation(0, 64, torch.empty(16))
+        pool.try_allocate.return_value = allocation
+        pool.reclaim_and_allocate.return_value = None
+        return ConsumerReservationManager(pool, 300, 16), pool, allocation
+
+    @staticmethod
+    def reserve(manager: ConsumerReservationManager):
+        record, write, reused, _ = manager.reserve(
+            "transfer", "hash", 64, (16,), "float32", torch.float32
+        )
+        assert record is not None
+        return record, write, reused
+
+    def test_writing_ready_and_repeated_completion_use_one_state_record(self):
+        manager, _, _ = self.manager()
+        record, write, _ = self.reserve(manager)
+
+        assert write
+        assert record.state is ConsumerReservationState.WRITING
+        assert manager.status("transfer") is record
+        completed = manager.complete("transfer", record.reservation_id)
+        repeated = manager.complete("transfer", record.reservation_id)
+
+        assert completed.accepted and completed.became_ready
+        assert repeated.accepted and repeated.repeated
+        assert record.state is ConsumerReservationState.READY
+        with pytest.raises(RuntimeError):
+            manager._transition(record, ConsumerReservationState.WRITING)
+
+    def test_writing_cancel_defers_the_only_allocation_release(self):
+        manager, pool, allocation = self.manager()
+        record, _, _ = self.reserve(manager)
+
+        assert manager.cancel("transfer", "wrong-id") == (
+            CancellationOutcome.REJECTED,
+            0,
+        )
+        outcome, dropped = manager.cancel("transfer", record.reservation_id)
+        assert outcome is CancellationOutcome.DEFERRED
+        assert dropped == 0
+        assert record.state is ConsumerReservationState.CANCEL_PENDING
+        pool.free.assert_not_called()
+
+        completed = manager.complete("transfer", record.reservation_id)
+        repeated = manager.complete("transfer", record.reservation_id)
+        assert completed.accepted and completed.discarded
+        assert not repeated.accepted
+        assert record.state is ConsumerReservationState.CANCELLED
+        assert record.allocation is None
+        pool.free.assert_called_once_with(allocation)
+
+    def test_ready_expiry_releases_once_and_keeps_a_tombstone(self):
+        manager, pool, allocation = self.manager()
+        record, _, _ = self.reserve(manager)
+        manager.complete("transfer", record.reservation_id)
+        record.expires_at = 0
+
+        first_expired, _, _ = manager.expire()
+        second_expired, _, _ = manager.expire()
+
+        assert first_expired == 1
+        assert second_expired == 0
+        assert manager.status("transfer") is None
+        assert record.state is ConsumerReservationState.EXPIRED
+        pool.free.assert_called_once_with(allocation)
+
+    def test_failed_allocation_returns_deferred_and_tombstone_counts(self):
+        manager, pool, _ = self.manager()
+        writing, _, _ = self.reserve(manager)
+        writing.expires_at = 1.5
+        assert manager.cancel("stale", "") == (
+            CancellationOutcome.PRE_RESERVED,
+            0,
+        )
+        manager.get("stale").expires_at = 0
+        pool.try_allocate.side_effect = [None, None]
+
+        monotonic = (
+            "vllm.distributed.ec_transfer.ec_connector.mooncake."
+            "reservation.time.monotonic"
+        )
+        with patch(monotonic, side_effect=[1.0, 2.0]):
+            record, write, reused, counts = manager.reserve(
+                "new", "new-hash", 64, (16,), "float32", torch.float32
+            )
+
+        assert record is None and not write and not reused
+        assert counts == (0, 1, 1)
+        assert writing.state is ConsumerReservationState.EXPIRE_PENDING
+        assert manager.get("stale") is None
+        pool.free.assert_not_called()
+
+    def test_expired_writer_refresh_precedes_re_reserve_and_old_completion(self):
+        manager, pool, old_allocation = self.manager()
+        new_allocation = memory.MemoryAllocation(256, 64, torch.ones(16))
+        pool.try_allocate.side_effect = [old_allocation, new_allocation]
+        old, _, _ = self.reserve(manager)
+        old.expires_at = 0
+        _, deferred, _ = manager.expire()
+
+        with pytest.raises(RuntimeError, match="still has an active writer"):
+            self.reserve(manager)
+        assert old.allocation is old_allocation
+        pool.free.assert_not_called()
+
+        (refreshed, dropped) = manager.cancel(
+            "transfer", old.reservation_id, abandon=True, refresh=True
+        )
+        new, write, _ = self.reserve(manager)
+        late = manager.complete("transfer", old.reservation_id)
+
+        assert deferred == 1
+        assert refreshed is CancellationOutcome.CANCELLED
+        assert dropped == 0
+        assert write and new.reservation_id != old.reservation_id
+        assert new.state is ConsumerReservationState.WRITING
+        assert new.allocation is new_allocation
+        assert not late.accepted
+        pool.free.assert_called_once_with(old_allocation)
+
+    def test_expired_writer_single_slot_is_reused_only_after_refresh_abandon(self):
+        transfer_engine = Mock()
+        transfer_engine.register_memory.return_value = 0
+        pool = ConsumerMemoryPool(256, transfer_engine)
+        pool.prepare(torch.device("cpu"), receiving_rank=True, allow_host=True)
+        manager = ConsumerReservationManager(pool, 300, 16)
+
+        old, _, _, _ = manager.reserve(
+            "transfer", "hash", 64, (16,), "float32", torch.float32
+        )
+        assert old is not None
+        assert old.allocation is not None
+        old_offset = old.allocation.offset
+        old.expires_at = 0
+        manager.expire()
+
+        with pytest.raises(RuntimeError, match="still has an active writer"):
+            manager.reserve("transfer", "hash", 64, (16,), "float32", torch.float32)
+        assert pool.try_allocate(64, (16,), torch.float32) is None
+
+        outcome, dropped = manager.cancel(
+            "transfer", old.reservation_id, abandon=True, refresh=True
+        )
+        new, write, _, _ = manager.reserve(
+            "transfer", "hash", 64, (16,), "float32", torch.float32
+        )
+        assert new is not None
+        assert outcome is CancellationOutcome.CANCELLED
+        assert dropped == 0
+        assert write and new.reservation_id != old.reservation_id
+        assert old.allocation is None
+        assert new.allocation is not None
+        assert new.allocation.offset == old_offset == 0
+
+    def test_expired_writer_completion_releases_before_re_reserve(self):
+        manager, pool, old_allocation = self.manager()
+        new_allocation = memory.MemoryAllocation(256, 64, torch.ones(16))
+        pool.try_allocate.side_effect = [old_allocation, new_allocation]
+        old, _, _ = self.reserve(manager)
+        old.expires_at = 0
+        manager.expire()
+
+        completed = manager.complete("transfer", old.reservation_id)
+        new, write, _ = self.reserve(manager)
+
+        assert completed.accepted and completed.discarded
+        assert old.state is ConsumerReservationState.EXPIRED
+        assert old.allocation is None
+        assert write and new.allocation is new_allocation
+        assert new.reservation_id != old.reservation_id
+        pool.free.assert_called_once_with(old_allocation)
+
+    def test_expired_writer_cancel_stays_deferred_until_completion(self):
+        manager, pool, allocation = self.manager()
+        record, _, _ = self.reserve(manager)
+        record.expires_at = 0
+        _, deferred, _ = manager.expire()
+
+        cancelled, dropped = manager.cancel("transfer", record.reservation_id)
+        assert deferred == 1
+        assert cancelled is CancellationOutcome.DEFERRED
+        assert dropped == 0
+        assert record.state is ConsumerReservationState.EXPIRE_PENDING
+        assert record.allocation is allocation
+        pool.free.assert_not_called()
+
+        completed = manager.complete("transfer", record.reservation_id)
+        assert completed.accepted and completed.discarded
+        assert record.state is ConsumerReservationState.EXPIRED
+        pool.free.assert_called_once_with(allocation)
+
+    def test_expired_writer_abandon_releases_once(self):
+        manager, pool, allocation = self.manager()
+        record, _, _ = self.reserve(manager)
+        record.expires_at = 0
+        manager.expire()
+
+        abandoned, first_dropped = manager.cancel(
+            "transfer", record.reservation_id, abandon=True
+        )
+        repeated, second_dropped = manager.cancel(
+            "transfer", record.reservation_id, abandon=True
+        )
+
+        assert abandoned is CancellationOutcome.CANCELLED
+        assert repeated is CancellationOutcome.PRE_RESERVED
+        assert first_dropped == second_dropped == 0
+        assert record.state is ConsumerReservationState.CANCELLED
+        assert record.allocation is None
+        pool.free.assert_called_once_with(allocation)
+
+    def test_cached_take_returns_the_memory_pool_canonical_allocation(self):
+        manager, pool, cached = self.manager()
+        lease = SimpleNamespace(value=cached)
+        canonical = memory.MemoryAllocation(256, 64, torch.ones(16))
+        pool.acquire_cached.return_value = lease
+        pool.publish.return_value = canonical
+
+        record, write, _ = self.reserve(manager)
+        assert not write and record.lease is lease
+        taken = manager.take("transfer", "hash")
+
+        assert taken is canonical
+        assert record.state is ConsumerReservationState.RESIDENT
+        assert record.allocation is None and record.lease is None
+        pool.publish.assert_called_once_with("hash", cached, lease)
+        pool.free.assert_not_called()
+        pool.release_cached.assert_not_called()
+
+    def test_tombstone_indexes_reap_by_prefix_without_scanning_records(self):
+        manager, _, _ = self.manager()
+
+        class NoScanDict(dict):
+            def __iter__(self):
+                raise AssertionError("record table must not be scanned")
+
+            def items(self):
+                raise AssertionError("record table must not be scanned")
+
+            def values(self):
+                raise AssertionError("record table must not be scanned")
+
+        manager._tombstone_limit = 3
+        manager._records = NoScanDict(manager._records)
+        for transfer_id in ("a", "b", "c"):
+            assert manager.cancel(transfer_id, "") == (
+                CancellationOutcome.PRE_RESERVED,
+                0,
+            )
+        assert manager.cancel("a", "") == (CancellationOutcome.PRE_RESERVED, 0)
+        assert manager.cancel("d", "") == (CancellationOutcome.PRE_RESERVED, 1)
+        assert list(manager._tombstones) == ["c", "a", "d"]
+        assert set(manager._records.keys()) == {"c", "a", "d"}
+
+        manager.get("c").expires_at = 0
+        _, _, dropped = manager.expire()
+        assert dropped == 1
+        assert list(manager._tombstones) == ["a", "d"]
+        assert set(manager._records.keys()) == {"a", "d"}
+        assert not manager._active_ids
+
+    def test_active_index_tracks_reserve_complete_take_and_expiry(self):
+        manager, pool, allocation = self.manager()
+        pool.publish.return_value = allocation
+        record, _, _ = self.reserve(manager)
+        assert list(manager._active_ids) == ["transfer"]
+        assert not manager._tombstones
+
+        manager.complete("transfer", record.reservation_id)
+        manager.take("transfer", "hash")
+        assert manager.get("transfer") is None
+        assert not manager._active_ids and not manager._tombstones
+
+        replacement, _, _ = self.reserve(manager)
+        manager.complete("transfer", replacement.reservation_id)
+        replacement.expires_at = 0
+        manager.expire()
+        assert not manager._active_ids
+        assert list(manager._tombstones) == ["transfer"]
+        assert manager.get("transfer").state is ConsumerReservationState.EXPIRED
+
+
 class TestECMooncakeWorkerTransfer:
+    def test_allocation_retry_accounts_for_expiry_after_outer_sweep(self):
+        transfer_engine = Mock()
+        transfer_engine.register_memory.return_value = 0
+        transfer_engine.local_session.return_value = "local-session"
+        pool = ConsumerMemoryPool(256, transfer_engine)
+        pool.prepare(torch.device("cpu"), receiving_rank=True, allow_host=True)
+        manager = ConsumerReservationManager(pool, 300, 16)
+        old, _, _, counts = manager.reserve(
+            "old", "old-hash", 64, (16,), "float32", torch.float32
+        )
+        assert counts == (0, 0, 0)
+        assert old is not None
+        assert old.allocation is not None
+        old_offset = old.allocation.offset
+        manager.complete("old", old.reservation_id)
+        old.expires_at = 1.5
+
+        worker = object.__new__(ECMooncakeWorker)
+        worker._consumer_worker_metrics = Counter()
+        worker._reservations = manager
+        worker._transfer = transfer_engine
+        payload = {
+            "transfer_id": "replacement",
+            "mm_hash": "replacement-hash",
+            "nbytes": 64,
+            "shape": [16],
+            "dtype": "float32",
+        }
+        monotonic = (
+            "vllm.distributed.ec_transfer.ec_connector.mooncake."
+            "reservation.time.monotonic"
+        )
+        with patch(monotonic, side_effect=[1.0, 1.0, 2.0, 2.0]):
+            replacement = worker._reserve_push_destination(payload)
+
+        assert replacement["write"]
+        assert manager.get("old").state is ConsumerReservationState.EXPIRED
+        assert manager.get("replacement").allocation.offset == old_offset == 0
+        assert worker._consumer_worker_metrics["reservations_expired"] == 1
+        assert worker._consumer_worker_metrics["cancellations_deferred"] == 0
+        assert worker._consumer_worker_metrics["cancel_records_dropped"] == 0
+
+    def test_failed_allocation_still_accounts_inner_expiry(self):
+        pool = Mock()
+        pool.lock = threading.RLock()
+        pool.acquire_cached.return_value = None
+        ready_allocation = memory.MemoryAllocation(0, 64, torch.empty(16))
+        writing_allocation = memory.MemoryAllocation(64, 64, torch.empty(16))
+        pool.try_allocate.side_effect = [ready_allocation, writing_allocation]
+        pool.reclaim_and_allocate.return_value = None
+        manager = ConsumerReservationManager(pool, 300, 16)
+        ready, _, _, _ = manager.reserve(
+            "ready", "ready-hash", 64, (16,), "float32", torch.float32
+        )
+        writing, _, _, _ = manager.reserve(
+            "writing", "writing-hash", 64, (16,), "float32", torch.float32
+        )
+        assert ready is not None and writing is not None
+        manager.complete("ready", ready.reservation_id)
+        assert manager.cancel("stale", "") == (
+            CancellationOutcome.PRE_RESERVED,
+            0,
+        )
+        ready.expires_at = writing.expires_at = 1.5
+        manager.get("stale").expires_at = 1.5
+        pool.try_allocate.side_effect = [None, None]
+
+        worker = object.__new__(ECMooncakeWorker)
+        worker._consumer_worker_metrics = Counter()
+        worker._reservations = manager
+        payload = {
+            "transfer_id": "failed",
+            "mm_hash": "failed-hash",
+            "nbytes": 64,
+            "shape": [16],
+            "dtype": "float32",
+        }
+        monotonic = (
+            "vllm.distributed.ec_transfer.ec_connector.mooncake."
+            "reservation.time.monotonic"
+        )
+        with patch(monotonic, side_effect=[1.0, 1.0, 2.0, 2.0, 2.0]):
+            with pytest.raises(RuntimeError, match="^EC consumer buffer pool is full$"):
+                worker._reserve_push_destination(payload)
+            metrics = dict(worker._consumer_worker_metrics)
+            worker._expire_push_reservations()
+
+        assert metrics == {
+            "reservations_expired": 1,
+            "cancellations_deferred": 1,
+            "cancel_records_dropped": 1,
+        }
+        assert dict(worker._consumer_worker_metrics) == metrics
+        assert ready.state is ConsumerReservationState.EXPIRED
+        assert writing.state is ConsumerReservationState.EXPIRE_PENDING
+        assert manager.get("stale") is None
+        pool.free.assert_called_once_with(ready_allocation)
+
+    def test_stale_shards_are_abandoned_before_remote_re_reserve(self):
+        worker = object.__new__(ECMooncakeWorker)
+        worker._control_client = Mock()
+        events: list[tuple[str, str] | tuple[str]] = []
+
+        def request(addr, payload):
+            events.append(("abandon", payload["reservation_id"]))
+            assert payload["abandon"] and payload["refresh"]
+            return {"cancelled": True}
+
+        worker._control_client.request.side_effect = request
+        replacement = [{"reservation_id": "new"}]
+
+        def reserve_remote(spec):
+            events.append(("reserve",))
+            return replacement
+
+        spec = ECMooncakePushSpec(
+            mm_hash="hash",
+            nbytes=64,
+            shape=(16,),
+            dtype="float32",
+            consumer_zmq="tcp://consumer:19019",
+            transfer_id="transfer",
+        )
+        shards = [
+            {
+                "addr": f"tcp://consumer:{19019 + rank}",
+                "reservation_id": f"old-{rank}",
+                "ready": False,
+            }
+            for rank in range(2)
+        ]
+
+        with patch.object(
+            worker,
+            "_reserve_remote",
+            side_effect=reserve_remote,
+        ):
+            assert worker._refresh_remote_reservations(spec, shards) is replacement
+        assert events == [
+            ("abandon", "old-0"),
+            ("abandon", "old-1"),
+            ("reserve",),
+        ]
+
     def test_reservation_snapshot_and_resident_retirement_are_atomic(self):
         worker = object.__new__(ECMooncakeWorker)
         worker._resolve_consumer_rank = Mock()
         worker._is_receiving_rank = True
         worker._transfer = Mock()
         worker._buffer_device = "cpu"
-        worker._push_reservations = {}
         worker._consumer_memory = ConsumerMemoryPool(256, Mock())
+        worker._reservations = ConsumerReservationManager(
+            worker._consumer_memory, _LEASE_TTL_SECONDS, 16
+        )
         retire_entered = threading.Event()
         finish_retire = threading.Event()
         lock_acquired = threading.Event()
@@ -2748,7 +3193,7 @@ class TestECMooncakeWorkerTransfer:
             finally:
                 connector.shutdown()
 
-    def test_expiry_retries_allocation_before_reclaiming_resident(
+    def test_abandon_retries_allocation_before_reclaiming_resident(
         self, mock_vllm_config_consumer
     ):
         config = mock_vllm_config_consumer
@@ -2786,22 +3231,21 @@ class TestECMooncakeWorkerTransfer:
                 ):
                     memory_pool.retire_stale({}, set())
                 old = worker._reserve_push_destination(payload("old", "old"))
-                worker._push_reservations["old"].expires_at = float("inf")
                 try_allocate = memory_pool.try_allocate
                 first_attempt = True
 
-                def expire_between_attempts(*args):
+                def abandon_between_attempts(*args):
                     nonlocal first_attempt
                     if first_attempt:
                         first_attempt = False
-                        worker._push_reservations["old"].expires_at = 0
+                        worker._cancel_push("old", old["reservation_id"], abandon=True)
                         return None
                     return try_allocate(*args)
 
                 with patch.object(
                     memory_pool,
                     "try_allocate",
-                    side_effect=expire_between_attempts,
+                    side_effect=abandon_between_attempts,
                 ):
                     new = worker._reserve_push_destination(payload("new", "new"))
 
@@ -2860,8 +3304,8 @@ class TestECMooncakeWorkerTransfer:
                     tensor.nbytes for tensor in sources.values()
                 )
                 assert all(
-                    reservation.ready
-                    for reservation in consumer._worker._push_reservations.values()
+                    reservation.state is ConsumerReservationState.READY
+                    for reservation in consumer._worker._reservations.active_records()
                 )
             finally:
                 producer.shutdown()
@@ -2913,7 +3357,7 @@ class TestECMooncakeWorkerTransfer:
                 assert reservation_data["nbytes"] == source.nbytes
                 old_reservation_id = reservation_data["reservation_id"]
                 reservation_data["_received_at"] -= _LEASE_TTL_SECONDS
-                consumer._worker._push_reservations["transfer-1"].expires_at = 0
+                consumer._worker._reservations.get("transfer-1").expires_at = 0
                 with patch.object(
                     scheduler._scheduler._control_client,
                     "request",
@@ -2927,12 +3371,12 @@ class TestECMooncakeWorkerTransfer:
                         {"op": "peers"},
                         {"op": "event_port"},
                     ]
-                    assert "transfer-1" in consumer._worker._push_reservations
+                    assert consumer._worker._reservations.status("transfer-1")
 
                     producer.save_caches({"hash": source}, "hash")
                     _wait_for_worker_io(producer)
                     assert (
-                        consumer._worker._push_reservations["transfer-1"].reservation_id
+                        consumer._worker._reservations.get("transfer-1").reservation_id
                         != old_reservation_id
                     )
                     deadline = time.monotonic() + 2
@@ -3002,12 +3446,12 @@ class TestECMooncakeWorkerTransfer:
                 producer.start_save_caches(encoder_cache={})
                 _, reservation = producer._worker._pending_reservations["hash"][0]
                 reservation.result(timeout=2)
-                assert "transfer-1" in consumer._worker._push_reservations
+                assert consumer._worker._reservations.status("transfer-1")
 
                 producer.get_finished({"request-1"})
                 _wait_for_worker_io(producer)
                 assert "hash" not in producer._worker._pending_reservations
-                assert "transfer-1" not in consumer._worker._push_reservations
+                assert consumer._worker._reservations.status("transfer-1") is None
             finally:
                 producer.shutdown()
                 consumer.shutdown()
@@ -3057,8 +3501,8 @@ class TestECMooncakeWorkerTransfer:
                 engine = producer._worker._transfer._engine
                 assert isinstance(engine, CopyingFakeTransferEngine)
                 assert engine.transfer_calls == [[source.nbytes]]
-                reservation = consumer._worker._push_reservations["transfer-1"]
-                assert reservation.ready
+                reservation = consumer._worker._reservations.get("transfer-1")
+                assert reservation.state is ConsumerReservationState.READY
                 assert (
                     consumer._worker._consumer_worker_metrics["completions_accepted"]
                     == 1
@@ -3096,8 +3540,10 @@ class TestECMooncakeWorkerTransfer:
                 producer.start_save_caches(encoder_cache={"hash": source})
                 _wait_for_worker_io(producer)
                 assert engine.transfer_calls == [[source.nbytes]]
-                cached = consumer._worker._push_reservations["transfer-2"]
-                assert cached.ready and not cached.owns_allocation
+                cached = consumer._worker._reservations.get("transfer-2")
+                assert cached is not None
+                assert cached.state is ConsumerReservationState.READY
+                assert cached.lease is not None
                 assert (
                     consumer._worker._consumer_worker_metrics["reservations_cached"]
                     == 1
@@ -3117,7 +3563,7 @@ class TestECMooncakeWorkerTransfer:
                 consumer.start_load_caches(loaded)
                 cached_meta = consumer.build_connector_worker_meta()
                 assert cached_meta.loaded == {"hash"}
-                assert "transfer-2" not in consumer._worker._push_reservations
+                assert consumer._worker._reservations.status("transfer-2") is None
                 assert torch.equal(loaded["hash"], source)
             finally:
                 producer.shutdown()
@@ -3366,8 +3812,8 @@ class TestECMooncakeWorkerTransfer:
                 assert engine.batch_unregister_calls == []
                 assert engine.transfer_calls == [[source.nbytes, source.nbytes]]
                 assert all(
-                    reservation.ready
-                    for reservation in consumer._worker._push_reservations.values()
+                    reservation.state is ConsumerReservationState.READY
+                    for reservation in consumer._worker._reservations.active_records()
                 )
             finally:
                 producer.shutdown()
@@ -3494,8 +3940,8 @@ class TestECMooncakeWorkerTransfer:
                 assert ops.count("complete_batch") == 1
                 assert "complete" not in ops
                 assert all(
-                    reservation.ready
-                    for reservation in consumer._worker._push_reservations.values()
+                    reservation.state is ConsumerReservationState.READY
+                    for reservation in consumer._worker._reservations.active_records()
                 )
             finally:
                 producer.shutdown()
@@ -3530,7 +3976,7 @@ class TestECMooncakeWorkerTransfer:
                     # No raise: the batch reports itself and gives up the
                     # consumer-side reservation.
                     _wait_for_worker_io(producer)
-                assert "transfer" not in consumer._worker._push_reservations
+                assert consumer._worker._reservations.status("transfer") is None
             finally:
                 producer.shutdown()
                 consumer.shutdown()
@@ -3571,6 +4017,57 @@ class TestECMooncakeWorkerTransfer:
             finally:
                 consumer.shutdown()
 
+    def test_cancel_pending_repeat_reserve_is_terminal_without_releasing(
+        self, mock_vllm_config_consumer
+    ):
+        mock_vllm_config_consumer.ec_transfer_config.ec_buffer_device = "cpu"
+        mock_vllm_config_consumer.ec_transfer_config.ec_buffer_size = 4096
+        mock_vllm_config_consumer.ec_transfer_config.ec_connector_extra_config[
+            "consumer_buffer_pool_size"
+        ] = 4096
+        payload = {
+            "mm_hash": "hash",
+            "transfer_id": "transfer",
+            "nbytes": 64,
+            "shape": [4, 4],
+            "dtype": "float32",
+        }
+
+        with patch_ec_mooncake_deps():
+            consumer = ECMooncakeConnector(
+                mock_vllm_config_consumer, ECConnectorRole.WORKER
+            )
+            memory_pool = consumer._worker._consumer_memory
+            try:
+                memory_pool.prepare(
+                    torch.device("cpu"), receiving_rank=True, allow_host=True
+                )
+                first = consumer._worker._reserve_push_destination(payload)
+                record = consumer._worker._reservations.get("transfer")
+                assert record is not None and record.allocation is not None
+                allocation = record.allocation
+                with patch.object(memory_pool, "free", wraps=memory_pool.free) as free:
+                    assert consumer._worker._cancel_push(
+                        "transfer", first["reservation_id"]
+                    )
+                    repeated = consumer._worker._reserve_push_destination(payload)
+
+                    assert repeated["cancelled"]
+                    assert not repeated["write"] and not repeated["ready"]
+                    assert record.state is ConsumerReservationState.CANCEL_PENDING
+                    assert record.allocation is allocation
+                    free.assert_not_called()
+
+                    completed = consumer._worker._complete_push(
+                        "transfer", first["reservation_id"]
+                    )
+                    assert completed.accepted and not completed.became_ready
+                    assert record.state is ConsumerReservationState.CANCELLED
+                    assert record.allocation is None
+                    free.assert_called_once_with(allocation)
+            finally:
+                consumer.shutdown()
+
     def test_same_hash_transfers_have_independent_lifecycles(
         self, mock_vllm_config_consumer
     ):
@@ -3601,12 +4098,18 @@ class TestECMooncakeWorkerTransfer:
                 second = consumer._worker._reserve_push_destination(payload("second"))
 
                 consumer._worker._complete_push("first", first["reservation_id"])
-                assert consumer._worker._push_reservations["first"].ready
-                assert not consumer._worker._push_reservations["second"].ready
+                assert (
+                    consumer._worker._reservations.get("first").state
+                    is ConsumerReservationState.READY
+                )
+                assert (
+                    consumer._worker._reservations.get("second").state
+                    is ConsumerReservationState.WRITING
+                )
 
                 assert consumer._worker._cancel_push("first", first["reservation_id"])
-                assert "first" not in consumer._worker._push_reservations
-                assert "second" in consumer._worker._push_reservations
+                assert consumer._worker._reservations.status("first") is None
+                assert consumer._worker._reservations.status("second")
                 assert consumer._worker._complete_push(
                     "second", second["reservation_id"]
                 )
@@ -3638,16 +4141,31 @@ class TestECMooncakeWorkerTransfer:
                     torch.device("cpu"), receiving_rank=True, allow_host=True
                 )
                 old = consumer._worker._reserve_push_destination(payload)
-                consumer._worker._push_reservations["transfer"].expires_at = 0
+                consumer._worker._reservations.get("transfer").expires_at = 0
                 consumer._worker._expire_push_reservations()
+                assert (
+                    consumer._worker._reservations.get("transfer").state
+                    is ConsumerReservationState.EXPIRE_PENDING
+                )
+                assert consumer._worker._cancel_push(
+                    "transfer",
+                    old["reservation_id"],
+                    abandon=True,
+                    refresh=True,
+                )
                 new = consumer._worker._reserve_push_destination(payload)
+                new_record = consumer._worker._reservations.get("transfer")
+                assert new_record is not None and new_record.allocation is not None
+                new_allocation = new_record.allocation
 
                 assert old["reservation_id"] != new["reservation_id"]
                 stale = consumer._worker._complete_push(
                     "transfer", old["reservation_id"]
                 )
                 assert not stale.accepted
-                assert not consumer._worker._push_reservations["transfer"].ready
+                assert consumer._worker._reservations.get("transfer") is new_record
+                assert new_record.allocation is new_allocation
+                assert new_record.state is ConsumerReservationState.WRITING
             finally:
                 consumer.shutdown()
 
@@ -3678,10 +4196,10 @@ class TestECMooncakeWorkerTransfer:
                 consumer._worker._complete_push(
                     "transfer-1", reservation["reservation_id"]
                 )
-                consumer._worker._push_reservations["transfer-1"].expires_at = 0
+                consumer._worker._reservations.get("transfer-1").expires_at = 0
 
                 assert consumer._worker._expire_push_reservations() == 1
-                assert "transfer-1" not in consumer._worker._push_reservations
+                assert consumer._worker._reservations.status("transfer-1") is None
             finally:
                 consumer.shutdown()
 
@@ -3712,9 +4230,11 @@ class TestECMooncakeWorkerTransfer:
                 assert consumer._worker._cancel_push("cancelled-transfer", "")
                 cancelled = consumer._worker._reserve_push_destination(payload)
                 assert cancelled["cancelled"] and not cancelled["write"]
-                assert "cancelled-transfer" not in consumer._worker._push_reservations
+                assert (
+                    consumer._worker._reservations.status("cancelled-transfer") is None
+                )
 
-                consumer._worker._cancelled_transfers["cancelled-transfer"] = 0
+                consumer._worker._reservations.get("cancelled-transfer").expires_at = 0
                 consumer._worker._expire_push_reservations()
                 replacement = consumer._worker._reserve_push_destination(payload)
                 assert replacement["write"]
@@ -3746,14 +4266,16 @@ class TestECMooncakeWorkerTransfer:
                 )
                 assert consumer._worker._cancel_push("refreshed-transfer", "")
                 assert consumer._worker._cancel_push("stale-transfer", "")
-                consumer._worker._cancelled_transfers["stale-transfer"] = 0.0
+                consumer._worker._reservations.get("stale-transfer").expires_at = 0.0
                 assert consumer._worker._cancel_push("refreshed-transfer", "")
 
                 consumer._worker._expire_push_reservations()
 
-                assert list(consumer._worker._cancelled_transfers) == [
-                    "refreshed-transfer"
-                ]
+                assert consumer._worker._reservations.get("stale-transfer") is None
+                assert (
+                    consumer._worker._reservations.get("refreshed-transfer").state
+                    is ConsumerReservationState.CANCELLED
+                )
                 assert (
                     consumer._worker._consumer_worker_metrics["cancel_records_dropped"]
                     == 1

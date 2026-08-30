@@ -58,6 +58,7 @@ class CompleteBatchRequest(TypedDict):
 class ReservationActionRequest(ReservationItem):
     op: Literal["complete", "cancel"]
     abandon: NotRequired[bool]
+    refresh: NotRequired[bool]
 
 
 ControlRequest = (
@@ -245,7 +246,7 @@ class ConsumerControlServer:
         reserve: Callable[[dict[str, Any]], dict[str, Any]],
         status: Callable[[str], dict[str, Any] | None],
         complete: Callable[[str, str], ControlCompletion],
-        cancel: Callable[[str, str, bool], bool],
+        cancel: Callable[[str, str, bool, bool], bool],
         reap: Callable[[], int],
         metrics_log_interval: float = 10,
         peer_ports: list[int] | None = None,
@@ -390,6 +391,7 @@ class ConsumerControlServer:
                                     str(request["transfer_id"]),
                                     str(request.get("reservation_id", "")),
                                     bool(request.get("abandon", False)),
+                                    bool(request.get("refresh", False)),
                                 )
                             }
                         else:
