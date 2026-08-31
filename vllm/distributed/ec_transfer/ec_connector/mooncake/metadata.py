@@ -14,7 +14,19 @@ from vllm.distributed.ec_transfer.ec_connector.base import (
 
 @dataclass
 class ECMooncakeLoadSpec:
-    """Per-item metadata shipped from scheduler to worker (pickle-friendly)."""
+    """Describe one Consumer-side cache load requested by the Scheduler.
+
+    Attributes:
+        mm_hash: Stable identifier of the multimodal encoder item.
+        num_token: Number of encoder tokens expected by the request.
+        nbytes: Tensor payload size in bytes.
+        shape: Tensor shape reconstructed by the Consumer.
+        dtype: Unqualified ``torch.dtype`` name used for reconstruction.
+        pushed: Whether the tensor came from a remote Producer reservation.
+        transfer_id: Identity shared by Scheduler, Producer, and Consumer.
+        reservation_id: Consumer-issued capability for completing the write.
+        local: Whether to reuse a tensor already resident on the Consumer.
+    """
 
     mm_hash: str
     num_token: int
@@ -31,7 +43,17 @@ class ECMooncakeLoadSpec:
 
 @dataclass
 class ECMooncakePushSpec:
-    """Destination reservation requested before an encoder tensor is ready."""
+    """Describe a destination reservation prepared before a tensor is ready.
+
+    Attributes:
+        mm_hash: Stable identifier of the multimodal encoder item.
+        nbytes: Number of bytes the Consumer must reserve.
+        shape: Shape of the tensor that will be written.
+        dtype: Unqualified ``torch.dtype`` name of the tensor.
+        consumer_zmq: Base control address of the destination Consumer.
+        transfer_id: Identity shared by Scheduler, Producer, and Consumer.
+        request_id: Request that owns the push and may cancel it.
+    """
 
     mm_hash: str
     nbytes: int
@@ -44,7 +66,12 @@ class ECMooncakePushSpec:
 
 @dataclass
 class ECMooncakeConnectorMetadata(ECConnectorMetadata):
-    """Worker-side metadata for one scheduler step."""
+    """Worker operations emitted for one Scheduler step.
+
+    Attributes:
+        loads: Consumer loads that should be attached to ``encoder_cache``.
+        pushes: Producer reservations that should begin before sources arrive.
+    """
 
     loads: list[ECMooncakeLoadSpec] = field(default_factory=list)
     pushes: list[ECMooncakePushSpec] = field(default_factory=list)
@@ -58,7 +85,15 @@ class ECMooncakeConnectorMetadata(ECConnectorMetadata):
 
 @dataclass
 class ECMooncakeWorkerMetadata(ECConnectorWorkerMetadata):
-    """Completion state reported from workers to the scheduler."""
+    """Completion state reported from Workers to the Scheduler.
+
+    Attributes:
+        loaded: Cache identifiers loaded successfully on this Worker.
+        failed_loads: Cache identifiers that could not be loaded.
+        reclaimed: Resident items evicted because the receive pool was full.
+        pending_loads: Whether this Worker still owns asynchronous load work.
+        pending_saves: Whether this Worker still owns asynchronous push work.
+    """
 
     loaded: set[str] = field(default_factory=set)
     failed_loads: set[str] = field(default_factory=set)

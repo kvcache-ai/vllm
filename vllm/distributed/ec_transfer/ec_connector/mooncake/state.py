@@ -1,5 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+"""Scheduler-owned lifecycle and indexes for Consumer-bound transfers."""
+
 from __future__ import annotations
 
 from collections import OrderedDict, deque
@@ -13,6 +15,12 @@ from vllm.distributed.ec_transfer.ec_connector.mooncake.metadata import (
 
 
 class SchedulerTransferState(Enum):
+    """Lifecycle states visible to the Scheduler.
+
+    The states cover waiting for a Consumer event, dispatching a Worker load,
+    retaining a locally reusable tensor, and terminal failure conditions.
+    """
+
     WAITING_EVENT = auto()
     AVAILABLE = auto()
     LOADING = auto()
@@ -26,6 +34,19 @@ class SchedulerTransferState(Enum):
 
 @dataclass
 class SchedulerTransfer:
+    """Track one transfer as observed by the Scheduler.
+
+    Attributes:
+        transfer_id: Cross-process identity of the transfer.
+        request_id: Request currently waiting for the transfer.
+        mm_hash: Stable identifier of the encoder-cache item.
+        state: Current Scheduler lifecycle state.
+        spec: Load metadata once the Consumer reports the tensor ready.
+        deadline: Expiry time for waiting, available, or terminal records.
+        last_error: Last terminal error associated with the transfer.
+        notified_requests: Requests already told that the item is unavailable.
+    """
+
     transfer_id: str
     request_id: str
     mm_hash: str
@@ -37,6 +58,8 @@ class SchedulerTransfer:
 
 
 class InvalidSchedulerTransferTransition(RuntimeError):
+    """Raised when code attempts an unsupported Scheduler state transition."""
+
     pass
 
 
@@ -79,7 +102,16 @@ _TERMINAL_STATES = {
 
 
 class SchedulerTransferTable:
-    """Own Scheduler transfer state and its hash lookup index."""
+    """Own Scheduler transfer state, lookup indexes, and dispatch queues.
+
+    Attributes:
+        _resident_capacity: Maximum bytes represented by resident records.
+        _tombstone_ttl: Retention time for terminal records.
+        _records: Ordered transfer records keyed by transfer ID.
+        _hash_index: Transfer IDs grouped by encoder-cache hash.
+        _loads_to_dispatch: Ordered IDs awaiting Worker metadata emission.
+        _unavailable_requests: Requests awaiting retryable failure reporting.
+    """
 
     def __init__(self, resident_capacity: int, tombstone_ttl: float) -> None:
         self._resident_capacity = resident_capacity

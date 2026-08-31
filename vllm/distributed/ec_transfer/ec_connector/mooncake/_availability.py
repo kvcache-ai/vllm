@@ -1,5 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+"""Guard access to the optional Mooncake TransferEngine dependency.
+
+Keeping the import check here lets metadata and configuration modules remain
+importable in environments that do not install Mooncake.
+"""
 
 _MOONCAKE_IMPORT_ERROR: ImportError | None
 try:
@@ -11,6 +16,11 @@ else:
 
 
 def ensure_mooncake_available() -> None:
+    """Raise a user-facing error when Mooncake is unavailable.
+
+    Raises:
+        ImportError: If ``mooncake-transfer-engine`` cannot be imported.
+    """
     if _MOONCAKE_IMPORT_ERROR is not None:
         raise ImportError(
             "Install mooncake-transfer-engine (see "

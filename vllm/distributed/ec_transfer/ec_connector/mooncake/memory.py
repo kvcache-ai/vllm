@@ -1,6 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Registered memory pools for Mooncake encoder-cache transfers."""
+"""Registered-memory allocation and residency for Mooncake transfers.
+
+The Producer pool stages source tensors in a registered slab.  The Consumer
+pool owns destination allocations from reservation through publication,
+resident reuse, CUDA-safe retirement, and pressure-driven reclamation.
+"""
 
 from __future__ import annotations
 
@@ -26,6 +31,14 @@ _T = TypeVar("_T")
 
 @dataclass
 class MemoryAllocation:
+    """Describe a tensor view carved from the Consumer receive slab.
+
+    Attributes:
+        offset: Byte offset of the allocation within the slab.
+        size: Aligned number of slab bytes owned by the allocation.
+        tensor: Typed tensor view exposed to transfer and cache code.
+    """
+
     offset: int
     size: int
     tensor: torch.Tensor
@@ -33,6 +46,15 @@ class MemoryAllocation:
 
 @dataclass
 class _ResidentEntry(Generic[_T]):
+    """Store one resident value and its ownership accounting.
+
+    Attributes:
+        value: Resident value owned by the pool.
+        nbytes: Capacity charged to the resident pool.
+        pinned: Whether active cache state prevents LRU eviction.
+        leases: Number of in-flight reservations borrowing this value.
+    """
+
     value: _T
     nbytes: int
     pinned: bool = True
@@ -41,6 +63,14 @@ class _ResidentEntry(Generic[_T]):
 
 @dataclass
 class ResidentLease(Generic[_T]):
+    """Represent a borrow of one resident entry.
+
+    Attributes:
+        key: Cache identifier used to find the canonical resident entry.
+        _entry: Entry retained even if the canonical mapping is replaced.
+        _active: Whether this lease still contributes to the reference count.
+    """
+
     key: str
     _entry: _ResidentEntry[_T]
     _active: bool = True
@@ -51,7 +81,13 @@ class ResidentLease(Generic[_T]):
 
 
 class ContiguousAllocator:
-    """First-fit allocator over a single contiguous byte region."""
+    """Allocate aligned regions from one contiguous byte range.
+
+    Attributes:
+        capacity: Total number of bytes managed by the allocator.
+        alignment: Allocation granularity in bytes.
+        _free: Sorted free ranges represented as ``(offset, size)`` pairs.
+    """
 
     def __init__(self, capacity: int, alignment: int = 256):
         self.capacity = capacity
@@ -90,7 +126,13 @@ class ContiguousAllocator:
 
 
 class ResidentPool(Generic[_T]):
-    """Reference accounting and LRU eviction for resident entries."""
+    """Track resident values, active leases, and LRU eviction eligibility.
+
+    Attributes:
+        used: Total bytes charged by current and leased displaced entries.
+        _entries: Canonical resident entries keyed by cache identifier.
+        _evictable: Unpinned and unleased entries in LRU order.
+    """
 
     def __init__(self):
         self.used = 0
@@ -195,12 +237,28 @@ class ResidentPool(Generic[_T]):
 
 @dataclass
 class StagedSources:
+    """Own Producer tensor views and their staging-slab regions.
+
+    Attributes:
+        tensors: Registered tensor views used as Mooncake sources.
+        regions: Allocator regions released after the write finishes.
+    """
+
     tensors: list[torch.Tensor]
     regions: list[tuple[int, int]]
 
 
 class ProducerMemoryPool:
-    """Own the registered staging slab and leases carved from it."""
+    """Own the Producer staging slab and regions carved from it.
+
+    Attributes:
+        _capacity: Requested staging-slab size in bytes.
+        _transfer: Data-plane owner used to register the slab.
+        _pool: Lazily allocated registered byte tensor.
+        _allocator: Region allocator for the staging slab.
+        _disabled: Whether initialization failed and fallback is required.
+        _lock: Lock protecting initialization and region allocation.
+    """
 
     def __init__(self, capacity: int, transfer: MooncakeTransfer) -> None:
         self._capacity = capacity
@@ -283,7 +341,21 @@ class ProducerMemoryPool:
 
 
 class ConsumerMemoryPool:
-    """Own the registered receive slab and resident allocation lifecycle."""
+    """Own the registered receive slab and resident allocation lifecycle.
+
+    Attributes:
+        _capacity: Requested receive-slab size in bytes.
+        _transfer: Data-plane owner used to register the slab.
+        _metrics: Counters describing resident-cache behavior.
+        _pool: Registered byte tensor that receives Mooncake writes.
+        _allocator: Region allocator for the receive slab.
+        _residents: Published allocations available for local reuse.
+        _retire_events: CUDA events guarding retired resident entries.
+        _pending_frees: Allocations waiting for CUDA consumers to finish.
+        _reclaimed: Cache identifiers evicted under allocation pressure.
+        _disabled: Whether receive-slab initialization has failed.
+        lock: Reentrant lock shared with reservation state transitions.
+    """
 
     def __init__(
         self,

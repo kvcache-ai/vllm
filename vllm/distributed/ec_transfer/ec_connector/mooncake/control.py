@@ -1,6 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Control-plane components for the Mooncake encoder-cache connector."""
+"""ZMQ control plane for Mooncake encoder-cache reservations and events.
+
+Tensor bytes never travel through this module.  It coordinates destination
+reservations, completion/cancellation, TP-shard discovery, and readiness
+notifications while :mod:`transfer` owns the Mooncake data plane.
+"""
 
 from __future__ import annotations
 
@@ -24,24 +29,34 @@ _RESERVATION_REAP_INTERVAL_SECONDS = 1
 
 
 class ReservationItem(TypedDict):
+    """Identify one Consumer reservation in a batch control request."""
+
     transfer_id: str
     reservation_id: str
 
 
 class PeersRequest(TypedDict):
+    """Request the control ports of every Consumer TP shard."""
+
     op: Literal["peers"]
 
 
 class EventPortRequest(TypedDict):
+    """Request the PUSH socket port used for readiness events."""
+
     op: Literal["event_port"]
 
 
 class StatusRequest(TypedDict):
+    """Request the current status of a transfer reservation."""
+
     op: Literal["status"]
     transfer_id: str
 
 
 class ReserveRequest(TypedDict):
+    """Request destination memory for an encoder-cache tensor."""
+
     op: Literal["reserve"]
     transfer_id: str
     mm_hash: str
@@ -51,11 +66,15 @@ class ReserveRequest(TypedDict):
 
 
 class CompleteBatchRequest(TypedDict):
+    """Mark several destination writes complete in one exchange."""
+
     op: Literal["complete_batch"]
     items: list[ReservationItem]
 
 
 class ReservationActionRequest(ReservationItem):
+    """Complete or cancel one previously created reservation."""
+
     op: Literal["complete", "cancel"]
     abandon: NotRequired[bool]
     refresh: NotRequired[bool]
@@ -72,11 +91,15 @@ ControlRequest = (
 
 
 class ControlSuccess(TypedDict):
+    """Successful wire response with an optional operation result."""
+
     ok: Literal[True]
     result: NotRequired[Any]
 
 
 class ControlFailure(TypedDict):
+    """Failed wire response containing a user-facing error message."""
+
     ok: Literal[False]
     error: str
 
@@ -86,12 +109,26 @@ ControlResponse = ControlSuccess | ControlFailure
 
 @dataclass(frozen=True)
 class ControlCompletion:
+    """Summarize the effect of a Consumer completion request.
+
+    Attributes:
+        accepted: Whether the reservation identity was valid.
+        became_ready: Whether this call newly made the tensor readable.
+    """
+
     accepted: bool
     became_ready: bool = False
 
 
 class ControlClient:
-    """Reusable per-thread REQ sockets for control requests."""
+    """Send control requests through reusable, thread-local REQ sockets.
+
+    Attributes:
+        _context: ZMQ context that owns all client sockets.
+        _timeout_ms: Send and receive timeout for each exchange.
+        _local: Thread-local mapping from address to REQ socket.
+        _closed: Whether the client context has been destroyed.
+    """
 
     def __init__(self, timeout_ms: int) -> None:
         self._context = zmq.Context()
@@ -163,7 +200,12 @@ def make_cancel_request(
 
 
 class ShardTopology:
-    """Discover and cache every control address for a consumer."""
+    """Discover and cache every control address for a Consumer.
+
+    Attributes:
+        _client: Client used to query the Consumer's ``peers`` operation.
+        _cache: Base Consumer addresses mapped to all TP-shard addresses.
+    """
 
     def __init__(self, client: ControlClient) -> None:
         self._client = client
@@ -196,7 +238,16 @@ class ShardTopology:
 
 
 class EventInbox:
-    """Non-blocking subscriber for consumer readiness events."""
+    """Receive Consumer readiness events without blocking the Scheduler.
+
+    Attributes:
+        _client: Control client used to discover event ports.
+        _topology: Source of Consumer TP-shard addresses.
+        _context: Lazily created context for the PULL socket.
+        _socket: PULL socket connected to all available Consumer shards.
+        _closed: Whether event resources have been released.
+        shard_count: Number of event channels connected successfully.
+    """
 
     def __init__(self, client: ControlClient, topology: ShardTopology) -> None:
         self._client = client
@@ -256,7 +307,29 @@ class EventInbox:
 
 
 class ConsumerControlServer:
-    """Expose consumer reservations over a ZMQ control channel."""
+    """Expose Consumer reservations and readiness events over ZMQ.
+
+    One server runs on every receiving TP rank.  The REP channel handles
+    reservation operations, while a PUSH channel publishes newly ready items
+    to the Scheduler.
+
+    Attributes:
+        host: Interface on which the control server listens.
+        port: Rank-local REP control port.
+        peer_ports: Control ports for every Consumer TP shard.
+        event_port: Dynamically allocated PUSH event port after startup.
+        _device: Device selected in the control thread when CUDA is used.
+        _reserve: Callback that allocates or reuses destination memory.
+        _status: Callback that reports active reservation state.
+        _complete: Callback that marks destination writes complete.
+        _cancel: Callback that cancels or abandons reservations.
+        _reap: Callback that expires stale reservations.
+        _metrics_log_interval: Interval for aggregate control-plane logs.
+        _stop: Signal requesting termination of the server loop.
+        _started: Signal indicating that socket binding has completed.
+        _thread: Background server thread.
+        _startup_error: Socket binding error captured from the server thread.
+    """
 
     def __init__(
         self,

@@ -43,7 +43,13 @@ __all__ = [
 
 
 class ECMooncakeConnector(ECConnectorBase):
-    """Route EC connector operations to the active Mooncake process role."""
+    """Preserve the public API while delegating to one process-role component.
+
+    Attributes:
+        _scheduler: Scheduler implementation when constructed for that role.
+        _worker: Worker implementation when constructed for that role.
+        _closed: Whether role-specific resources have already been released.
+    """
 
     def __init__(self, vllm_config: VllmConfig, role: ECConnectorRole):
         super().__init__(vllm_config=vllm_config, role=role)

@@ -1,6 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Unit tests for ECMooncakeConnector."""
+"""Behavioral contract for the refactored Mooncake encoder-cache connector.
+
+The suite covers public compatibility, configuration, control and data planes,
+memory ownership, the three role-specific lifecycle managers, Scheduler
+metadata, Worker orchestration, and failure or cancellation races.
+"""
 
 from __future__ import annotations
 
@@ -92,6 +97,19 @@ pytest_plugins = ("tests.v1.ec_connector.unit.test_ec_example_connector",)
 
 
 class CopyingFakeTransferEngine:
+    """Model Mooncake registration rules while copying bytes in-process.
+
+    Attributes:
+        registered: Base addresses of currently registered ranges.
+        regions: Registered byte lengths keyed by base address.
+        register_calls: Address batches passed to memory registration.
+        unregister_calls: Addresses passed to single-range unregistration.
+        batch_unregister_calls: Address batches passed to unregistration.
+        transfer_calls: Byte lengths recorded for each transfer batch.
+        transfer_batches: Complete source and destination transfer arguments.
+        initialize_calls: Arguments used to initialize the fake engine.
+    """
+
     def __init__(self, *args, **kwargs):
         self.registered: set[int] = set()
         self.regions: dict[int, int] = {}
@@ -179,6 +197,8 @@ def _wait_for_worker_io(
 
 
 class TestECMooncakeControlPlane:
+    """Validate ZMQ client reuse, shard discovery, events, and server RPCs."""
+
     def test_worker_get_ip_failure_does_not_construct_client(
         self, mock_vllm_config_producer
     ):
@@ -483,6 +503,8 @@ def patch_ec_mooncake_deps():
 
 
 class TestMooncakeTransfer:
+    """Validate lazy engine setup and source registration ownership."""
+
     def test_initializes_engine_once_on_first_use(self):
         engine = CopyingFakeTransferEngine()
         with patch.object(
@@ -617,6 +639,8 @@ class TestMooncakeTransfer:
 
 
 class TestECMooncakeFactory:
+    """Validate factory registration and compatibility exports."""
+
     def test_factory_registers_connector(self):
         cls = ECConnectorFactory.get_connector_class(
             Mock(ec_connector="ECMooncakeConnector")
@@ -638,6 +662,8 @@ class TestECMooncakeFactory:
 
 
 class TestContiguousAllocator:
+    """Validate aligned allocation, reuse, and range coalescing."""
+
     def test_reuses_and_coalesces_contiguous_regions(self):
         allocator = ContiguousAllocator(1024, alignment=256)
 
@@ -660,6 +686,8 @@ class TestContiguousAllocator:
 
 
 class TestResidentPool:
+    """Validate resident pin, lease, replacement, and LRU semantics."""
+
     def test_lru_skips_rejected_entry_and_replaces_without_losing_owner(self):
         pool = ResidentPool[str]()
         pool.insert("oldest", "first", 256)
@@ -691,7 +719,11 @@ class TestResidentPool:
 
 
 class TestMooncakeMemoryPools:
+    """Validate Producer staging and Consumer residency ownership."""
+
     class _Event:
+        """Minimal CUDA-event substitute controlling deferred frees."""
+
         def __init__(self, complete: bool):
             self.complete = complete
 
@@ -839,6 +871,8 @@ class TestMooncakeMemoryPools:
 
 
 class TestMooncakeECConfig:
+    """Validate normalization, defaults, immutability, and bounds."""
+
     def test_defaults_are_an_immutable_snapshot(self, mock_vllm_config_producer):
         config = MooncakeECConfig.from_vllm_config(
             mock_vllm_config_producer, ECConnectorRole.SCHEDULER
@@ -1184,6 +1218,8 @@ class TestMooncakeECConfig:
 
 
 class TestECMooncakeConnectorValidation:
+    """Validate role construction, optional dependencies, and topology rules."""
+
     @pytest.mark.parametrize(
         "role", [ECConnectorRole.SCHEDULER, ECConnectorRole.WORKER]
     )
@@ -1364,6 +1400,8 @@ class TestECMooncakeConnectorValidation:
         self, mock_vllm_config_producer, method, args
     ):
         class OtherMetadata(ECConnectorMetadata):
+            """Represent an incompatible connector metadata implementation."""
+
             pass
 
         worker = Mock()
@@ -1504,6 +1542,8 @@ class TestECMooncakeConnectorValidation:
 
 
 class TestECMooncakeMetadata:
+    """Validate metadata compatibility, pickling, and aggregation inputs."""
+
     def test_old_imports_reexport_packaged_metadata(self):
         assert ECMooncakeLoadSpec is metadata.ECMooncakeLoadSpec
         assert ECMooncakePushSpec is metadata.ECMooncakePushSpec
@@ -1553,6 +1593,8 @@ class TestECMooncakeMetadata:
 
 
 class TestECMooncakeWorkerMetadataAggregation:
+    """Validate cross-rank success intersection and failure union rules."""
+
     def test_an_item_one_rank_missed_is_not_loaded(self):
         """Each rank gathers from its own cache, so all of them must have it.
 
@@ -1576,6 +1618,8 @@ class TestECMooncakeWorkerMetadataAggregation:
 
 
 class TestSchedulerTransferTable:
+    """Validate Scheduler transfer transitions, indexes, and retention."""
+
     @staticmethod
     def pushed_spec(transfer_id: str, mm_hash: str = "hash") -> ECMooncakeLoadSpec:
         return ECMooncakeLoadSpec(
@@ -1751,6 +1795,8 @@ class TestSchedulerTransferTable:
 
 
 class TestECMooncakeSchedulerMetadata:
+    """Validate Scheduler decisions and per-step Worker metadata."""
+
     def test_missing_push_event_is_tracked(
         self, mock_vllm_config_consumer, mock_request_with_3_mm
     ):
@@ -2698,6 +2744,8 @@ class TestECMooncakeSchedulerMetadata:
 
 
 class TestConsumerReservationManager:
+    """Validate Consumer destination ownership and cancellation races."""
+
     @staticmethod
     def manager():
         pool = Mock()
@@ -2936,6 +2984,8 @@ class TestConsumerReservationManager:
         manager, _, _ = self.manager()
 
         class NoScanDict(dict):
+            """Fail if reservation code scans the complete record mapping."""
+
             def __iter__(self):
                 raise AssertionError("record table must not be scanned")
 
@@ -2986,6 +3036,8 @@ class TestConsumerReservationManager:
 
 
 class TestECMooncakeWorkerTransfer:
+    """Validate end-to-end Worker reservation, push, load, and cleanup flows."""
+
     def test_allocation_retry_accounts_for_expiry_after_outer_sweep(self):
         transfer_engine = Mock()
         transfer_engine.register_memory.return_value = 0
@@ -3432,6 +3484,8 @@ class TestECMooncakeWorkerTransfer:
             assert batch_started.wait(2)
 
             class NoScanRecords(OrderedDict):
+                """Fail if Producer hot paths scan every transfer record."""
+
                 def __iter__(self):
                     raise AssertionError("record table scanned")
 
@@ -3442,6 +3496,8 @@ class TestECMooncakeWorkerTransfer:
                     raise AssertionError("record table scanned")
 
             class NoScanIndex(OrderedDict):
+                """Fail if Producer hot paths scan every lifecycle index."""
+
                 def __iter__(self):
                     raise AssertionError("reapable index scanned")
 

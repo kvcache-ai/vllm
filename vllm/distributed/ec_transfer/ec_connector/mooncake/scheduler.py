@@ -1,5 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+"""Scheduler-side planning and observation for Mooncake cache transfers.
+
+The Scheduler prepares Producer reservations, consumes Consumer readiness
+events, emits per-step Worker metadata, and converts Worker results back into
+request availability without owning tensor memory or running data transfers.
+"""
 
 from __future__ import annotations
 
@@ -55,6 +61,35 @@ _MAX_TERMINAL_TRANSFER_RECORDS = 1 << 16
 
 
 class ECMooncakeScheduler:
+    """Coordinate Mooncake transfers from the vLLM Scheduler process.
+
+    Attributes:
+        _is_producer: Whether this Scheduler prepares outbound pushes.
+        _is_consumer: Whether this Scheduler waits for inbound pushes.
+        _reservation_zmq_addr: Base Consumer control-plane address.
+        _consumer_pool_capacity: Capacity mirrored for resident-state limits.
+        _push_wait_timeout: Maximum wait for a Consumer readiness event.
+        _consumer_metrics_log_interval: Interval for Scheduler metrics logs.
+        _encoder_cache_hidden_dim: Hidden width used to derive push shapes.
+        _model_config: Model metadata used for dtypes and multimodal fields.
+        _control_client: Client for reservation status and cancellation.
+        _topology: Discovery cache for Consumer TP shards.
+        _event_inbox: Non-blocking source of Consumer readiness events.
+        _control_executor: Executor for cancellation requests.
+        _metadata_fields_cache: Placeholder metadata fields by modality.
+        _consumer_metrics_started_at: Start time of the current metric window.
+        _consumer_scheduler_metrics: Counters for scheduling decisions.
+        _drain_pending: Whether the next scheduling pass should drain events.
+        _drained_at: Time of the most recent readiness-event drain.
+        _pending_cancels: Asynchronous cancellations by transfer ID.
+        _transfers: Scheduler-owned transfer lifecycle table.
+        _scheduler_pending_work: Whether Workers reported unfinished work.
+        _pushes_to_prepare: Push specs awaiting metadata emission.
+        _prepared_push_transfer_ids: Transfer IDs already prepared once.
+        _event_shard_count: Number of Consumer event channels in the topology.
+        _event_ready_shards: Ready shard IDs accumulated per transfer.
+    """
+
     @classmethod
     def from_vllm_config(cls, vllm_config: VllmConfig) -> ECMooncakeScheduler:
         ensure_mooncake_available()

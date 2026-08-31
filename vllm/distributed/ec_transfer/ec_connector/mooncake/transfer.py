@@ -1,6 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Mooncake data-plane ownership for encoder-cache transfers."""
+"""Mooncake data-plane engine and memory-registration ownership.
+
+The wrapper isolates optional-engine initialization, session addressing,
+synchronous batched writes, and the lifetime of transient source registrations.
+"""
 
 from __future__ import annotations
 
@@ -21,13 +25,32 @@ except ImportError:
 
 @dataclass
 class _SourceRegistration:
+    """Retain one transient source range while batches reference it.
+
+    Attributes:
+        tensor: Tensor keeping the registered storage alive.
+        nbytes: Exact registered byte length.
+        users: Number of active acquisitions of this address.
+    """
+
     tensor: torch.Tensor
     nbytes: int
     users: int = 1
 
 
 class MooncakeTransfer:
-    """Own a lazy Mooncake engine and its transient memory registrations."""
+    """Own a lazy Mooncake engine and transient memory registrations.
+
+    Attributes:
+        _hostname: Address advertised in the Mooncake session identifier.
+        _protocol: Transport protocol used to initialize ``TransferEngine``.
+        _engine: Lazily initialized Mooncake engine.
+        _engine_lock: Lock serializing first engine initialization.
+        _source_registrations: Reference-counted transient source ranges.
+        _pending_unregister: Tensors retained after an unregister failure.
+        _registration_lock: Lock protecting registration ownership.
+        _closed: Whether final data-plane cleanup has begun.
+    """
 
     def __init__(self, hostname: str, protocol: str) -> None:
         self._hostname = hostname

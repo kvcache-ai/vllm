@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+"""Parse and validate configuration shared by Mooncake connector roles."""
 
 from __future__ import annotations
 
@@ -56,6 +57,25 @@ def _nonempty_string(name: str, value: object) -> str:
 
 @dataclass(frozen=True)
 class MooncakeECConfig:
+    """Validated runtime settings for one Scheduler or Worker instance.
+
+    Attributes:
+        is_producer: Whether this instance can originate encoder-cache pushes.
+        is_consumer: Whether this instance can receive encoder-cache pushes.
+        protocol: Mooncake transport protocol passed to ``TransferEngine``.
+        buffer_device: Device used for registered staging and receive buffers.
+        reservation_port: Rank-adjusted Worker control-plane base port.
+        reservation_addr: Scheduler-visible Consumer control address.
+        control_timeout_s: Timeout for one ZMQ request/response exchange.
+        push_wait_timeout_s: Maximum Scheduler wait for a ready notification.
+        transfer_workers: Maximum concurrent data-plane transfer batches.
+        control_workers: Maximum concurrent control-plane operations.
+        producer_pool_size: Bytes reserved for the Producer staging pool.
+        consumer_pool_size: Bytes reserved for the Consumer receive pool.
+        transfer_metrics_log_interval: Producer transfer log interval in seconds.
+        consumer_metrics_log_interval: Consumer metrics log interval in seconds.
+    """
+
     is_producer: bool
     is_consumer: bool
     protocol: str
@@ -79,6 +99,19 @@ class MooncakeECConfig:
     def from_vllm_config(
         cls, vllm_config: VllmConfig, role: ECConnectorRole
     ) -> MooncakeECConfig:
+        """Build role-specific settings from the top-level vLLM config.
+
+        Args:
+            vllm_config: Source vLLM configuration.
+            role: Connector process role being configured.
+
+        Returns:
+            Validated, normalized Mooncake connector settings.
+
+        Raises:
+            ValueError: If an option is invalid or the requested parallel
+                topology is unsupported for a Producer.
+        """
         parallel_config = vllm_config.parallel_config
         ec_config = vllm_config.ec_transfer_config
         assert ec_config is not None

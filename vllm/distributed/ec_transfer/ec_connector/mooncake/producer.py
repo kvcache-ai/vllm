@@ -1,6 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Producer push lifecycle and source ownership."""
+"""Producer-side push lifecycle, futures, and source-tensor ownership.
+
+This module records when a push may advance or release its source.  Worker
+orchestration performs the actual control exchanges and Mooncake writes.
+"""
 
 from __future__ import annotations
 
@@ -22,6 +26,8 @@ from vllm.distributed.ec_transfer.ec_connector.mooncake.metadata import (
 
 
 class ProducerPushState(Enum):
+    """Lifecycle of one Producer push from reservation to terminal state."""
+
     RESERVING = auto()
     WAITING_SOURCE = auto()
     WRITING = auto()
@@ -34,12 +40,33 @@ class ProducerPushState(Enum):
 
 @dataclass
 class ProducerSourceLease:
+    """Keep an encoder tensor alive until every remote write is settled.
+
+    Attributes:
+        tensor: Source encoder tensor owned by the push.
+        ready_event: CUDA event proving that production of the tensor finished.
+    """
+
     tensor: torch.Tensor
     ready_event: torch.Event | None
 
 
 @dataclass
 class ProducerPushRecord:
+    """Collect all asynchronous state for one Producer push.
+
+    Attributes:
+        spec: Immutable identity and destination metadata for the push.
+        state: Current Producer lifecycle state.
+        reservation_futures: Futures resolving Consumer shard reservations.
+        reservations: Resolved destination descriptors for every shard.
+        shard_futures: Data-plane futures that may still read the source.
+        source: Source tensor lease once encoder computation has completed.
+        batch_future: Transfer or cancellation batch currently owning the push.
+        error: First asynchronous error retained for Worker reporting.
+        source_at: Time the source became available for queue metrics.
+    """
+
     spec: ECMooncakePushSpec
     state: ProducerPushState
     reservation_futures: list[Future[list[dict[str, Any]]]]
@@ -89,7 +116,17 @@ _TERMINAL_LIMIT = 1 << 16
 
 
 class ProducerPushManager:
-    """Own producer push records, transitions, and source tensor leases."""
+    """Own Producer push records, transitions, and source tensor leases.
+
+    Attributes:
+        _records: All active and retained terminal records by transfer ID.
+        _active_ids: Non-terminal transfer IDs in insertion order.
+        _reapable_terminal_ids: Terminal records safe to discard.
+        _unreported_ids: Failed records awaiting Worker error reporting.
+        _batch_ids: Records whose batch future has not been reaped.
+        _source_waiters: Transfer IDs waiting for each cache identifier.
+        _lock: Reentrant lock protecting lifecycle and ownership changes.
+    """
 
     def __init__(self) -> None:
         self._records: OrderedDict[str, ProducerPushRecord] = OrderedDict()

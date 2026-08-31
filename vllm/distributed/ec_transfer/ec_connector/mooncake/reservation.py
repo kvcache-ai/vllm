@@ -1,6 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Consumer-side reservation state and destination ownership."""
+"""Consumer-side reservation lifecycle and destination-memory ownership.
+
+Reservations make remote writes idempotent and ensure cancellation or expiry
+cannot free a destination while Mooncake may still be writing into it.
+"""
 
 from __future__ import annotations
 
@@ -20,6 +24,8 @@ from vllm.distributed.ec_transfer.ec_connector.mooncake.memory import (
 
 
 class ConsumerReservationState(Enum):
+    """Lifecycle of one Consumer destination reservation."""
+
     RESERVED = auto()
     WRITING = auto()
     READY = auto()
@@ -72,6 +78,21 @@ _DEFERRED_STATES = {
 
 @dataclass
 class ConsumerReservation:
+    """Own the identity and destination allocation of one remote push.
+
+    Attributes:
+        transfer_id: Cross-process identity of the transfer.
+        mm_hash: Stable identifier of the encoder-cache item.
+        reservation_id: Consumer-issued identity required for completion.
+        state: Current destination reservation state.
+        shape: Expected tensor shape.
+        dtype: Unqualified expected ``torch.dtype`` name.
+        allocation: Receive-slab allocation while this record owns it.
+        lease: Borrowed resident allocation used for a cache hit.
+        created_at: Monotonic creation time used for diagnostics.
+        expires_at: Deadline for the active record or terminal tombstone.
+    """
+
     transfer_id: str
     mm_hash: str
     reservation_id: str
@@ -86,6 +107,15 @@ class ConsumerReservation:
 
 @dataclass(frozen=True)
 class CompletionResult:
+    """Describe how a completion request affected a reservation.
+
+    Attributes:
+        accepted: Whether transfer and reservation identities matched.
+        became_ready: Whether the call transitioned WRITING to READY.
+        repeated: Whether the reservation was already ready.
+        discarded: Whether deferred cancellation consumed the completion.
+    """
+
     accepted: bool
     became_ready: bool = False
     repeated: bool = False
@@ -93,6 +123,8 @@ class CompletionResult:
 
 
 class CancellationOutcome(Enum):
+    """Outcome categories used for control responses and metrics."""
+
     REJECTED = auto()
     PRE_RESERVED = auto()
     DEFERRED = auto()
@@ -100,7 +132,16 @@ class CancellationOutcome(Enum):
 
 
 class ConsumerReservationManager:
-    """Own reservation transitions and all destination allocation releases."""
+    """Own reservation transitions and destination allocation releases.
+
+    Attributes:
+        _memory: Consumer memory pool that owns destination allocations.
+        _lease_ttl: Lifetime of active reservations and terminal tombstones.
+        _tombstone_limit: Maximum retained terminal cancellation records.
+        _records: Active and terminal records keyed by transfer ID.
+        _active_ids: Transfer IDs requiring expiry scans.
+        _tombstones: Terminal records retained in expiry order.
+    """
 
     def __init__(
         self,

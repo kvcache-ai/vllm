@@ -1,6 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Mooncake data-plane orchestration for the encoder-cache connector."""
+"""Worker-side orchestration of Mooncake control, memory, and data planes.
+
+Consumer Workers expose rank-local reservations and publish received tensors.
+Producer Workers reserve every destination shard, bind computed sources, run
+batched Mooncake writes, and report asynchronous completion to the Scheduler.
+"""
 
 from __future__ import annotations
 
@@ -77,6 +82,19 @@ _PUSH_STAGES = (
 
 @dataclass
 class _PushPerfWindow:
+    """Accumulate Producer batch metrics between periodic log messages.
+
+    Attributes:
+        started_at: Monotonic start time of the aggregation window.
+        batches: Number of completed push batches.
+        items: Number of push records included in those batches.
+        bytes: Number of tensor bytes written over the data plane.
+        skipped_items: Items satisfied by cache or cancellation without a write.
+        failures: Number of batches that ended in failure.
+        stage_totals_ms: Accumulated time for every push stage.
+        stage_max_ms: Maximum observed time for every push stage.
+    """
+
     started_at: float = field(default_factory=time.monotonic)
     batches: int = 0
     items: int = 0
@@ -102,6 +120,40 @@ class ECMooncakeWorker:
     the same source concurrently. Producers remain unsharded and unreplicated.
     With DP, the caller must route both halves of a request to the same replica
     and pass that replica's control address to the producer.
+
+    Attributes:
+        is_producer: Whether this Worker originates encoder-cache pushes.
+        is_consumer: Whether this Worker accepts encoder-cache pushes.
+        _buffer_device: Device requested for registered memory pools.
+        _reservation_zmq_port: Base Consumer control port for this DP replica.
+        _transfer: Owner of the Mooncake engine and memory registrations.
+        _consumer_worker_metrics: Consumer lifecycle metric counters.
+        _consumer_memory: Registered receive slab and resident cache.
+        _reservations: Consumer destination reservation state manager.
+        _consumer_rank_resolved: Whether TP/PP placement has been discovered.
+        _is_receiving_rank: Whether this PP stage owns encoder outputs.
+        _tp_rank: Tensor-parallel rank used to derive the local control port.
+        _tp_size: Number of Consumer tensor-parallel destination shards.
+        _control_server: Rank-local Consumer reservation server.
+        _consumer_metrics_log_interval: Consumer metrics log interval.
+        _consumer_metrics_started_at: Start time of the Consumer metric window.
+        _producer_memory: Registered Producer source staging slab.
+        _transfer_metrics_log_interval: Producer performance log interval.
+        _control_client: Client for remote Consumer control operations.
+        _topology: Discovery cache for remote Consumer TP shards.
+        _producer_metrics: Producer lifecycle metric counters.
+        _io_executor: Executor that owns transfer and cancellation batches.
+        _control_executor: Executor that creates remote reservations.
+        _shard_pool: Lazily created executor for concurrent TP-shard work.
+        _shard_pool_lock: Lock protecting shard-pool initialization.
+        _producer_pushes: Producer lifecycle and source-ownership manager.
+        _push_perf_lock: Lock protecting Producer performance counters.
+        _push_perf: Current Producer performance aggregation window.
+        _active_transfer_batches: Batches currently executing data-plane work.
+        _queued_transfer_batches: Batches submitted but not yet executing.
+        _completed_loads: Successful Consumer loads awaiting reporting.
+        _failed_loads: Failed Consumer loads awaiting reporting.
+        _shutdown: Whether Worker resource shutdown has started.
     """
 
     @classmethod
