@@ -58,6 +58,7 @@ _LEASE_TTL_SECONDS = 300
 _DRAIN_MIN_INTERVAL = 0.005
 _MAX_PENDING_EVENTS = 4096
 _MAX_TERMINAL_TRANSFER_RECORDS = 1 << 16
+_CANCEL_ATTEMPTS = 2
 
 
 class ECMooncakeScheduler:
@@ -158,13 +159,37 @@ class ECMooncakeScheduler:
     def _cancel_remote(
         self, consumer_zmq: str, transfer_id: str, reservation_id: str
     ) -> bool:
-        cancelled = False
-        for addr in self._topology.shards(consumer_zmq):
-            result = self._control_client.request(
-                addr,
-                make_cancel_request(transfer_id, reservation_id),
+        pending = None
+        for _ in range(_CANCEL_ATTEMPTS):
+            pending = self._topology.discover(consumer_zmq)
+            if pending is not None:
+                break
+        if pending is None:
+            raise RuntimeError(
+                f"Could not discover every EC consumer shard at {consumer_zmq}"
             )
-            cancelled |= isinstance(result, dict) and bool(result.get("cancelled"))
+
+        cancelled = False
+        error: BaseException | None = None
+        for _ in range(_CANCEL_ATTEMPTS):
+            failed = []
+            for addr in pending:
+                try:
+                    result = self._control_client.request(
+                        addr,
+                        make_cancel_request(transfer_id, reservation_id),
+                    )
+                except Exception as exc:
+                    if error is None:
+                        error = exc
+                    failed.append(addr)
+                    continue
+                cancelled |= isinstance(result, dict) and bool(result.get("cancelled"))
+            if not failed:
+                return cancelled
+            pending = failed
+        if error is not None:
+            raise error
         return cancelled
 
     def _note_awaiting_push(

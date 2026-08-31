@@ -211,30 +211,36 @@ class ShardTopology:
         self._client = client
         self._cache: dict[str, list[str]] = {}
 
-    def shards(self, base_addr: str) -> list[str]:
+    def discover(self, base_addr: str) -> list[str] | None:
+        """Return a confirmed complete topology, retrying transient failures."""
         cached = self._cache.get(base_addr)
         if cached is not None:
             return cached
-        shards = [base_addr]
         try:
             reply = self._client.request(base_addr, {"op": "peers"})
             ports = reply.get("ports") if isinstance(reply, dict) else None
-            if ports:
-                prefix = base_addr.rsplit(":", 1)[0]
-                shards = [f"{prefix}:{int(port)}" for port in ports]
+            if not isinstance(ports, list) or not ports:
+                raise ValueError("invalid or empty peer list")
+            prefix = base_addr.rsplit(":", 1)[0]
+            shards = [f"{prefix}:{int(port)}" for port in ports]
         except Exception:
             logger.warning(
                 "EC Mooncake consumer at %s did not report its shards; "
-                "assuming it is unsharded.",
+                "using it directly for this attempt.",
                 base_addr,
                 exc_info=True,
             )
+            return None
         self._cache[base_addr] = shards
         if len(shards) > 1:
             logger.info(
                 "EC Mooncake consumer at %s has %d shards", base_addr, len(shards)
             )
         return shards
+
+    def shards(self, base_addr: str) -> list[str]:
+        """Return confirmed shards or a one-attempt data-plane fallback."""
+        return self.discover(base_addr) or [base_addr]
 
 
 class EventInbox:
@@ -244,9 +250,9 @@ class EventInbox:
         _client: Control client used to discover event ports.
         _topology: Source of Consumer TP-shard addresses.
         _context: Lazily created context for the PULL socket.
-        _socket: PULL socket connected to all available Consumer shards.
+        _socket: PULL socket connected to every expected Consumer shard.
         _closed: Whether event resources have been released.
-        shard_count: Number of event channels connected successfully.
+        shard_count: Number of event channels in the complete topology.
     """
 
     def __init__(self, client: ControlClient, topology: ShardTopology) -> None:
@@ -260,30 +266,29 @@ class EventInbox:
     def _connect(self, base_addr: str) -> None:
         if self._socket is not None:
             return
-        context = zmq.Context()
-        socket = context.socket(zmq.PULL)
-        connected = 0
-        for addr in self._topology.shards(base_addr):
+        shards = self._topology.discover(base_addr)
+        if shards is None:
+            return
+        endpoints = []
+        for addr in shards:
             try:
                 event_port = self._client.request(addr, {"op": "event_port"})
                 address, _ = addr.rsplit(":", 1)
-                socket.connect(f"{address}:{int(event_port)}")
+                endpoints.append(f"{address}:{int(event_port)}")
             except Exception:
                 logger.warning(
                     "EC Mooncake could not subscribe to the event channel of "
-                    "consumer shard %s; its readiness will only be seen "
-                    "through reserve replies.",
+                    "consumer shard %s; retrying the complete topology later.",
                     addr,
                 )
-                continue
-            connected += 1
-        if not connected:
-            socket.close(linger=0)
-            context.term()
-            return
+                return
+        context = zmq.Context()
+        socket = context.socket(zmq.PULL)
+        for endpoint in endpoints:
+            socket.connect(endpoint)
         self._context = context
         self._socket = socket
-        self.shard_count = connected
+        self.shard_count = len(shards)
 
     def drain(self, base_addr: str) -> list[dict[str, Any]]:
         self._connect(base_addr)

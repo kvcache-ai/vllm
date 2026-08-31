@@ -18,7 +18,7 @@ from concurrent.futures import Future, ThreadPoolExecutor
 from contextlib import suppress
 from dataclasses import dataclass, field
 from functools import partial
-from typing import TYPE_CHECKING, Any, TypeVar
+from typing import TYPE_CHECKING, Any, TypeVar, cast
 
 import torch
 
@@ -70,6 +70,7 @@ if TYPE_CHECKING:
 _LEASE_TTL_SECONDS = 300
 _RESERVATION_REFRESH_SECONDS = _LEASE_TTL_SECONDS / 2
 _MAX_CANCELLED_TRANSFER_IDS = 1 << 16
+_CANCEL_ATTEMPTS = 2
 _PUSH_STAGES = (
     "reserve",
     "cuda",
@@ -103,6 +104,26 @@ class _PushPerfWindow:
     failures: int = 0
     stage_totals_ms: dict[str, float] = field(default_factory=dict)
     stage_max_ms: dict[str, float] = field(default_factory=dict)
+
+
+class _FanoutError(RuntimeError):
+    """Retain shard outcomes after every started task settles."""
+
+    def __init__(self, error: BaseException, results: list[Any | None]) -> None:
+        self.results = results
+        super().__init__(str(error))
+
+
+class _ReservationFanoutError(RuntimeError):
+    """Expose partial reservations for precise idempotent cleanup retries."""
+
+    def __init__(
+        self,
+        error: BaseException,
+        partial_reservations: list[dict[str, Any]],
+    ) -> None:
+        super().__init__(str(error))
+        self.partial_reservations = partial_reservations
 
 
 class ECMooncakeWorker:
@@ -499,32 +520,94 @@ class ECMooncakeWorker:
         tasks: list[Callable[[], _T]],
         on_submit: Callable[[int, Future[_T]], None] | None = None,
     ) -> list[_T]:
-        futures = []
-        error: Exception | None = None
+        if not tasks:
+            return []
+        futures: list[tuple[int, Future[_T]]] = []
+        results: list[_T | None] = [None] * len(tasks)
+        error: BaseException | None = None
         for index, task in enumerate(tasks[1:], 1):
             try:
                 future = self._shard_executor().submit(task)
             except Exception as exc:
                 error = exc
                 break
-            futures.append(future)
+            futures.append((index, future))
             if on_submit is not None:
                 on_submit(index, future)
-        results = []
         if error is None:
             try:
-                results.append(tasks[0]())
+                results[0] = tasks[0]()
             except Exception as exc:
                 error = exc
-        for future in futures:
+        for index, future in futures:
             try:
-                results.append(future.result())
+                results[index] = future.result()
             except Exception as exc:
                 if error is None:
                     error = exc
         if error is not None:
-            raise error
-        return results
+            raise _FanoutError(error, results)
+        return cast(list[_T], results)
+
+    def _cancel_reservations(
+        self,
+        spec: ECMooncakePushSpec,
+        reservations: list[dict[str, Any]],
+        *,
+        refresh: bool = False,
+        record: ProducerPushRecord | None = None,
+    ) -> None:
+        reservations = [
+            shard for shard in reservations if not shard.get("cancelled", False)
+        ]
+        if not reservations:
+            return
+
+        def cancel(shard: dict[str, Any]) -> dict[str, Any]:
+            result = self._control_client.request(
+                str(shard.get("addr", spec.consumer_zmq)),
+                make_cancel_request(
+                    spec.transfer_id,
+                    str(shard.get("reservation_id", "")),
+                    abandon=True,
+                    refresh=refresh,
+                ),
+            )
+            if not isinstance(result, dict) or not result.get("cancelled"):
+                raise RuntimeError(
+                    f"Could not cancel EC reservation for mm_hash={spec.mm_hash}"
+                )
+            return shard
+
+        def track(_index: int, future: Future[dict[str, Any]]) -> None:
+            if record is not None:
+                self._producer_pushes.track_shard_futures([record], [future])
+
+        self._run_fanout([partial(cancel, shard) for shard in reservations], track)
+
+    def _retry_cancel_reservations(
+        self,
+        spec: ECMooncakePushSpec,
+        reservations: list[dict[str, Any]],
+        *,
+        record: ProducerPushRecord | None = None,
+    ) -> None:
+        pending = [shard for shard in reservations if not shard.get("cancelled", False)]
+        error: _FanoutError | None = None
+        for _ in range(_CANCEL_ATTEMPTS):
+            try:
+                self._cancel_reservations(spec, pending, record=record)
+            except _FanoutError as exc:
+                error = exc
+                pending = [
+                    shard
+                    for index, shard in enumerate(pending)
+                    if exc.results[index] is None
+                ]
+                continue
+            return
+        assert error is not None
+        raise error
 
     def _reserve_remote(self, spec: ECMooncakePushSpec) -> list[dict[str, Any]]:
         """Reserve a destination on every shard of the consumer."""
@@ -532,34 +615,56 @@ class ECMooncakeWorker:
         tasks: list[Callable[[], dict[str, Any]]] = [
             partial(self._reserve_one, addr, spec) for addr in shards
         ]
-        return self._run_fanout(tasks)
+        try:
+            return self._run_fanout(tasks)
+        except _FanoutError as exc:
+            successful = [result for result in exc.results if isinstance(result, dict)]
+            try:
+                self._retry_cancel_reservations(spec, successful)
+            except _FanoutError as cleanup_error:
+                raise _ReservationFanoutError(exc, successful) from cleanup_error
+            raise _ReservationFanoutError(exc, successful) from exc
 
     def _refresh_remote_reservations(
         self,
         spec: ECMooncakePushSpec,
         reservations: list[dict[str, Any]],
+        record: ProducerPushRecord | None = None,
     ) -> list[dict[str, Any]]:
-        for shard in reservations:
-            if (
-                shard.get("ready", False)
-                or shard.get("cached", False)
-                or shard.get("cancelled", False)
-            ):
-                continue
-            result = self._control_client.request(
-                str(shard.get("addr", spec.consumer_zmq)),
-                make_cancel_request(
-                    spec.transfer_id,
-                    str(shard["reservation_id"]),
-                    abandon=True,
-                    refresh=True,
-                ),
-            )
-            if not isinstance(result, dict) or not result.get("cancelled"):
-                raise RuntimeError(
-                    f"Could not refresh EC reservation for mm_hash={spec.mm_hash}"
-                )
+        stale = [
+            shard
+            for shard in reservations
+            if not shard.get("ready", False)
+            and not shard.get("cached", False)
+            and not shard.get("cancelled", False)
+        ]
+        try:
+            self._cancel_reservations(spec, stale, refresh=True, record=record)
+        except _FanoutError as exc:
+            pending = [
+                shard for index, shard in enumerate(stale) if exc.results[index] is None
+            ]
+            try:
+                self._retry_cancel_reservations(spec, pending, record=record)
+            except _FanoutError as cleanup_error:
+                raise exc from cleanup_error
+            raise
         return self._reserve_remote(spec)
+
+    @staticmethod
+    def _validate_push_source(push: ProducerPushRecord) -> None:
+        source = push.source
+        assert source is not None
+        tensor = source.tensor
+        spec = push.spec
+        if tuple(tensor.shape) != tuple(spec.shape):
+            raise ValueError(f"EC source shape mismatch for mm_hash={spec.mm_hash}")
+        if str(tensor.dtype).split(".")[-1] != spec.dtype:
+            raise ValueError(f"EC source dtype mismatch for mm_hash={spec.mm_hash}")
+        if not tensor.is_contiguous():
+            raise ValueError(f"EC source must be contiguous for mm_hash={spec.mm_hash}")
+        if tensor.nbytes != spec.nbytes:
+            raise ValueError(f"EC source size mismatch for mm_hash={spec.mm_hash}")
 
     def start_save_caches(
         self,
@@ -649,6 +754,7 @@ class ECMooncakeWorker:
         failure: Exception | None = None
         try:
             for push in pushes:
+                self._validate_push_source(push)
                 stage_started_at = time.monotonic()
                 reservations = self._producer_pushes.resolve_reservations(push)
                 stale = [
@@ -661,7 +767,7 @@ class ECMooncakeWorker:
                 ]
                 if stale:
                     reservations = self._refresh_remote_reservations(
-                        push.spec, reservations
+                        push.spec, reservations, push
                     )
                     self._producer_pushes.replace_reservations(push, reservations)
                 stage_ms["reserve"] += (time.monotonic() - stage_started_at) * 1000
@@ -797,7 +903,12 @@ class ECMooncakeWorker:
             by_destination.setdefault(
                 str(reservation.get("addr", push.spec.consumer_zmq)), []
             ).append((push, reservation))
-        for consumer_zmq, items in by_destination.items():
+        destinations = list(by_destination.items())
+
+        def notify(
+            consumer_zmq: str,
+            items: list[tuple[ProducerPushRecord, dict[str, Any]]],
+        ) -> None:
             result = self._control_client.request(
                 consumer_zmq,
                 {
@@ -820,22 +931,47 @@ class ECMooncakeWorker:
                         f"Unknown EC reservation for mm_hash={push.spec.mm_hash}"
                     )
 
+        def track(index: int, future: Future[None]) -> None:
+            records = {
+                push.spec.transfer_id: push for push, _ in destinations[index][1]
+            }
+            self._producer_pushes.track_shard_futures(list(records.values()), [future])
+
+        self._run_fanout(
+            [
+                partial(notify, destination, items)
+                for destination, items in destinations
+            ],
+            track,
+        )
+
+    @staticmethod
+    def _known_reservations(record: ProducerPushRecord) -> list[dict[str, Any]]:
+        if record.reservations:
+            return list(record.reservations)
+        reservations: list[dict[str, Any]] = []
+        for future in record.reservation_futures:
+            try:
+                reservations.extend(future.result())
+            except _ReservationFanoutError as exc:
+                reservations.extend(exc.partial_reservations)
+            except Exception:
+                continue
+        return reservations
+
     def _abandon_pushes(self, pushes: list[ProducerPushRecord]) -> None:
         """Release the consumer-side reservations of a batch that failed."""
         for push in pushes:
-            shards = push.reservations
+            shards = self._known_reservations(push)
             if not shards:
                 shards = [{"addr": push.spec.consumer_zmq, "reservation_id": ""}]
-            for shard in shards:
-                with suppress(Exception):
-                    self._control_client.request(
-                        str(shard.get("addr", push.spec.consumer_zmq)),
-                        make_cancel_request(
-                            push.spec.transfer_id,
-                            str(shard.get("reservation_id", "")),
-                            abandon=True,
-                        ),
-                    )
+            try:
+                self._retry_cancel_reservations(push.spec, shards, record=push)
+            except _FanoutError:
+                logger.exception(
+                    "Failed to abandon EC reservations for transfer_id=%s",
+                    push.spec.transfer_id,
+                )
 
     def _record_push_perf(
         self,
@@ -925,24 +1061,25 @@ class ECMooncakeWorker:
 
     def _cancel_orphaned_reservation(self, record: ProducerPushRecord) -> None:
         try:
-            for shard in self._producer_pushes.resolve_reservations(record):
-                if shard.get("cached", False) or shard.get("cancelled", False):
-                    continue
-                self._control_client.request(
-                    str(shard.get("addr", record.spec.consumer_zmq)),
-                    make_cancel_request(
-                        record.spec.transfer_id,
-                        str(shard.get("reservation_id", "")),
-                        abandon=True,
-                    ),
-                )
+            reservations = self._producer_pushes.resolve_reservations(record)
         except Exception:
-            logger.exception(
-                "Failed to cancel orphaned EC reservation for transfer_id=%s",
-                record.spec.transfer_id,
-            )
-        finally:
-            self._producer_pushes.finish_cancel(record)
+            reservations = self._known_reservations(record)
+        known = bool(reservations)
+        reservations = [
+            shard
+            for shard in reservations
+            if not shard.get("cached", False) and not shard.get("cancelled", False)
+        ]
+        if not known:
+            reservations = [{"addr": record.spec.consumer_zmq, "reservation_id": ""}]
+        error = None
+        try:
+            self._retry_cancel_reservations(record.spec, reservations, record=record)
+        except _FanoutError as exc:
+            error = exc
+        self._producer_pushes.finish_cancel(record)
+        if error is not None:
+            raise error
 
     def get_finished(
         self, finished_req_ids: set[str]

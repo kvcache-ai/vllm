@@ -300,11 +300,12 @@ class TestECMooncakeControlPlane:
         for control_socket in sockets:
             control_socket.connect.assert_called_once_with("tcp://consumer:19019")
 
-    def test_topology_caches_discovery_and_failure_fallback(self):
+    def test_topology_retries_transient_discovery_failures(self):
         client = Mock(spec=ControlClient)
         client.request.side_effect = [
             {"ports": [19019, 19020]},
             RuntimeError("old consumer"),
+            {"ports": [19029, 19030]},
         ]
         topology = ShardTopology(client)
 
@@ -317,36 +318,62 @@ class TestECMooncakeControlPlane:
             "tcp://consumer:19020",
         ]
         assert topology.shards("tcp://legacy:19019") == ["tcp://legacy:19019"]
+        assert topology.shards("tcp://legacy:19019") == [
+            "tcp://legacy:19029",
+            "tcp://legacy:19030",
+        ]
+        assert topology.shards("tcp://legacy:19019") == [
+            "tcp://legacy:19029",
+            "tcp://legacy:19030",
+        ]
         assert client.request.call_args_list == [
             call("tcp://consumer:19019", {"op": "peers"}),
             call("tcp://legacy:19019", {"op": "peers"}),
+            call("tcp://legacy:19019", {"op": "peers"}),
         ]
 
-    def test_event_inbox_drains_without_blocking_and_closes_once(self):
+    def test_event_inbox_retries_until_every_shard_is_connected(self):
         client = Mock(spec=ControlClient)
-        client.request.side_effect = [20001, RuntimeError("missing shard")]
-        topology = Mock(spec=ShardTopology)
-        topology.shards.return_value = [
-            "tcp://consumer:19019",
-            "tcp://consumer:19020",
+        client.request.side_effect = [
+            RuntimeError("peers not ready"),
+            {"ports": [19019, 19020]},
+            20001,
+            RuntimeError("event port not ready"),
+            20001,
+            20002,
         ]
+        topology = ShardTopology(client)
         context = MagicMock()
         socket = context.socket.return_value
         event = {"transfer_id": "transfer", "ready": True}
         socket.recv_json.side_effect = [event, zmq.Again()]
 
-        with patch.object(control.zmq, "Context", return_value=context):
+        with patch.object(control.zmq, "Context", return_value=context) as create:
             inbox = EventInbox(client, topology)
-            assert inbox.drain("tcp://consumer:19019") == [event]
+            assert inbox.drain("tcp://consumer:19019") == []
             assert inbox.shard_count == 1
+            create.assert_not_called()
+            assert inbox.drain("tcp://consumer:19019") == []
+            assert inbox.shard_count == 1
+            create.assert_not_called()
+            assert inbox.drain("tcp://consumer:19019") == [event]
+            assert inbox.shard_count == 2
             inbox.close()
             inbox.close()
 
         assert client.request.call_args_list == [
+            call("tcp://consumer:19019", {"op": "peers"}),
+            call("tcp://consumer:19019", {"op": "peers"}),
+            call("tcp://consumer:19019", {"op": "event_port"}),
+            call("tcp://consumer:19020", {"op": "event_port"}),
             call("tcp://consumer:19019", {"op": "event_port"}),
             call("tcp://consumer:19020", {"op": "event_port"}),
         ]
-        socket.connect.assert_called_once_with("tcp://consumer:20001")
+        create.assert_called_once_with()
+        assert socket.connect.call_args_list == [
+            call("tcp://consumer:20001"),
+            call("tcp://consumer:20002"),
+        ]
         assert socket.recv_json.call_args_list == [
             call(flags=zmq.DONTWAIT),
             call(flags=zmq.DONTWAIT),
@@ -1797,6 +1824,42 @@ class TestSchedulerTransferTable:
 class TestECMooncakeSchedulerMetadata:
     """Validate Scheduler decisions and per-step Worker metadata."""
 
+    def test_cancel_confirms_topology_and_retries_only_failed_shards(self):
+        scheduler = object.__new__(ECMooncakeScheduler)
+        scheduler._topology = Mock(spec=ShardTopology)
+        scheduler._topology.discover.side_effect = [
+            None,
+            ["shard-0", "shard-1", "shard-2"],
+        ]
+        scheduler._control_client = Mock(spec=ControlClient)
+        called = []
+
+        def request(addr, _payload):
+            called.append(addr)
+            if addr == "shard-0" and called.count(addr) == 1:
+                raise RuntimeError("cancel shard failed")
+            return {"cancelled": True}
+
+        scheduler._control_client.request.side_effect = request
+        assert scheduler._cancel_remote("base", "transfer", "reservation")
+        assert scheduler._topology.discover.call_args_list == [
+            call("base"),
+            call("base"),
+        ]
+        assert called == ["shard-0", "shard-1", "shard-2", "shard-0"]
+
+    def test_cancel_rejects_unconfirmed_topology_without_sending(self):
+        scheduler = object.__new__(ECMooncakeScheduler)
+        scheduler._topology = Mock(spec=ShardTopology)
+        scheduler._topology.discover.return_value = None
+        scheduler._control_client = Mock(spec=ControlClient)
+
+        with pytest.raises(RuntimeError, match="discover every EC consumer shard"):
+            scheduler._cancel_remote("base", "transfer", "reservation")
+
+        assert scheduler._topology.discover.call_count == 2
+        scheduler._control_client.request.assert_not_called()
+
     def test_missing_push_event_is_tracked(
         self, mock_vllm_config_consumer, mock_request_with_3_mm
     ):
@@ -3170,17 +3233,98 @@ class TestECMooncakeWorkerTransfer:
             for rank in range(2)
         ]
 
-        with patch.object(
-            worker,
-            "_reserve_remote",
-            side_effect=reserve_remote,
+        with (
+            ThreadPoolExecutor(max_workers=2) as executor,
+            patch.object(worker, "_shard_executor", return_value=executor),
+            patch.object(worker, "_reserve_remote", side_effect=reserve_remote),
         ):
             assert worker._refresh_remote_reservations(spec, shards) is replacement
-        assert events == [
+        assert set(events[:2]) == {
             ("abandon", "old-0"),
             ("abandon", "old-1"),
-            ("reserve",),
+        }
+        assert events[2] == ("reserve",)
+
+    def test_cancel_retry_only_retries_failed_shards(self):
+        worker = object.__new__(ECMooncakeWorker)
+        worker._control_client = Mock()
+        attempts: Counter[str] = Counter()
+
+        def request(_addr, payload):
+            reservation_id = payload["reservation_id"]
+            attempts[reservation_id] += 1
+            if reservation_id == "r0" and attempts[reservation_id] == 1:
+                raise RuntimeError("transient cancel failure")
+            return {"cancelled": True}
+
+        worker._control_client.request.side_effect = request
+        spec = ECMooncakePushSpec(
+            mm_hash="hash",
+            nbytes=64,
+            shape=(16,),
+            dtype="float32",
+            consumer_zmq="tcp://consumer:19019",
+            transfer_id="transfer",
+        )
+        reservations = [
+            {
+                "addr": f"tcp://consumer:{19019 + rank}",
+                "reservation_id": f"r{rank}",
+            }
+            for rank in range(3)
         ]
+
+        with (
+            ThreadPoolExecutor(max_workers=2) as executor,
+            patch.object(worker, "_shard_executor", return_value=executor),
+        ):
+            worker._retry_cancel_reservations(spec, reservations)
+
+        assert attempts == Counter({"r0": 2, "r1": 1, "r2": 1})
+
+    def test_partial_refresh_cleans_only_the_failed_shard_and_keeps_first_error(
+        self,
+    ):
+        worker = object.__new__(ECMooncakeWorker)
+        worker._control_client = Mock()
+        calls: list[tuple[str, bool]] = []
+
+        def request(_addr, payload):
+            reservation_id = payload["reservation_id"]
+            refreshing = payload.get("refresh", False)
+            calls.append((reservation_id, refreshing))
+            if refreshing and reservation_id == "r0":
+                raise RuntimeError("refresh shard failed")
+            return {"cancelled": True}
+
+        worker._control_client.request.side_effect = request
+        spec = ECMooncakePushSpec(
+            mm_hash="hash",
+            nbytes=64,
+            shape=(16,),
+            dtype="float32",
+            consumer_zmq="tcp://consumer:19019",
+            transfer_id="transfer",
+        )
+        reservations = [
+            {
+                "addr": f"tcp://consumer:{19019 + rank}",
+                "reservation_id": f"r{rank}",
+                "ready": False,
+            }
+            for rank in range(3)
+        ]
+
+        with (
+            ThreadPoolExecutor(max_workers=2) as executor,
+            patch.object(worker, "_shard_executor", return_value=executor),
+            pytest.raises(RuntimeError, match="^refresh shard failed$"),
+        ):
+            worker._refresh_remote_reservations(spec, reservations)
+
+        assert Counter(calls) == Counter(
+            {("r0", True): 1, ("r1", True): 1, ("r2", True): 1, ("r0", False): 1}
+        )
 
     def test_reservation_snapshot_and_resident_retirement_are_atomic(self):
         worker = object.__new__(ECMooncakeWorker)
@@ -3845,6 +3989,340 @@ class TestECMooncakeWorkerTransfer:
                 assert str(errors[0]) == "second shard submit failed"
             finally:
                 finish_slow.set()
+                connector.shutdown()
+
+    @pytest.mark.parametrize("source_before_failure", [False, True])
+    def test_partial_reserve_is_compensated_before_its_future_fails(
+        self, mock_vllm_config_producer, source_before_failure
+    ):
+        mock_vllm_config_producer.ec_transfer_config.ec_buffer_device = "cpu"
+        source = torch.empty(16)
+        spec = ECMooncakePushSpec(
+            mm_hash="hash",
+            nbytes=source.nbytes,
+            shape=tuple(source.shape),
+            dtype="float32",
+            consumer_zmq="tcp://consumer:0",
+            transfer_id="transfer",
+        )
+        cancel_attempts = 0
+
+        def reserve_one(addr, _spec):
+            if addr.endswith(":1"):
+                raise RuntimeError("reserve shard failed")
+            return {"addr": addr, "reservation_id": "partial-r0"}
+
+        def request(_addr, payload):
+            nonlocal cancel_attempts
+            assert payload == {
+                "op": "cancel",
+                "transfer_id": "transfer",
+                "reservation_id": "partial-r0",
+                "abandon": True,
+            }
+            cancel_attempts += 1
+            if cancel_attempts == 1:
+                raise RuntimeError("transient cleanup failure")
+            return {"cancelled": True}
+
+        with patch_ec_mooncake_deps():
+            connector = ECMooncakeConnector(
+                mock_vllm_config_producer, ECConnectorRole.WORKER
+            )
+            worker = connector._worker
+            connector.bind_connector_metadata(
+                ECMooncakeConnectorMetadata(pushes=[spec])
+            )
+            try:
+                with (
+                    patch.object(
+                        worker._topology,
+                        "shards",
+                        return_value=["tcp://consumer:0", "tcp://consumer:1"],
+                    ),
+                    patch.object(worker, "_reserve_one", side_effect=reserve_one),
+                    patch.object(
+                        worker._control_client, "request", side_effect=request
+                    ),
+                ):
+                    connector.start_save_caches(
+                        encoder_cache={"hash": source}
+                        if source_before_failure
+                        else None
+                    )
+                    record = worker._producer_pushes.get("transfer")
+                    assert record is not None
+                    with pytest.raises(
+                        RuntimeError, match="^reserve shard failed$"
+                    ) as e:
+                        record.reservation_futures[0].result(timeout=2)
+                    assert e.value.partial_reservations == [
+                        {
+                            "addr": "tcp://consumer:0",
+                            "reservation_id": "partial-r0",
+                        }
+                    ]
+                    assert cancel_attempts == 2
+
+                    if source_before_failure:
+                        assert record.source is not None
+                        connector.build_connector_worker_meta()
+                        _wait_for_worker_io(connector)
+                    else:
+                        assert record.state is ProducerPushState.FAILED
+                        connector.save_caches({"hash": source}, "hash")
+                    assert record.state is ProducerPushState.FAILED
+                    assert record.source is None
+            finally:
+                connector.shutdown()
+
+    def test_partial_complete_abandons_all_shards_before_releasing_source(
+        self, mock_vllm_config_producer
+    ):
+        mock_vllm_config_producer.ec_transfer_config.ec_buffer_device = "cpu"
+        source = torch.empty(16)
+        spec = ECMooncakePushSpec(
+            mm_hash="hash",
+            nbytes=source.nbytes,
+            shape=tuple(source.shape),
+            dtype="float32",
+            consumer_zmq="tcp://consumer:0",
+            transfer_id="transfer",
+        )
+        reservations = [
+            {
+                "addr": f"tcp://consumer:{rank}",
+                "reservation_id": f"r{rank}",
+                "dst_session": f"session-{rank}",
+                "dst_ptr": 1000 + rank,
+                "nbytes": source.nbytes,
+                "write": True,
+                "ready": False,
+            }
+            for rank in range(2)
+        ]
+        slow_started = threading.Event()
+        finish_slow = threading.Event()
+        cancelled: list[str] = []
+
+        def request(addr, payload):
+            if payload["op"] == "complete_batch":
+                if addr.endswith(":0"):
+                    raise RuntimeError("complete shard failed")
+                slow_started.set()
+                assert finish_slow.wait(2)
+                return {"items": [{"completed": True}]}
+            assert payload["op"] == "cancel" and payload["abandon"]
+            cancelled.append(payload["reservation_id"])
+            return {"cancelled": True}
+
+        with patch_ec_mooncake_deps():
+            connector = ECMooncakeConnector(
+                mock_vllm_config_producer, ECConnectorRole.WORKER
+            )
+            worker = connector._worker
+            connector.bind_connector_metadata(
+                ECMooncakeConnectorMetadata(pushes=[spec])
+            )
+            try:
+                with (
+                    patch.object(worker, "_reserve_remote", return_value=reservations),
+                    patch.object(
+                        worker._control_client, "request", side_effect=request
+                    ),
+                    patch.object(worker._producer_memory, "stage", return_value=None),
+                    patch.object(
+                        worker._transfer,
+                        "acquire_sources",
+                        return_value=[source.data_ptr()],
+                    ),
+                    patch.object(worker._transfer, "release_sources"),
+                    patch.object(worker._transfer, "write"),
+                ):
+                    connector.start_save_caches(encoder_cache={"hash": source})
+                    assert connector.build_connector_worker_meta().pending_saves
+                    record = worker._producer_pushes.get("transfer")
+                    assert record is not None and record.batch_future is not None
+                    assert slow_started.wait(2)
+                    assert record.source is not None
+                    assert not record.batch_future.done()
+                    finish_slow.set()
+                    record.batch_future.result(timeout=2)
+                    connector.build_connector_worker_meta()
+
+                assert Counter(cancelled) == Counter({"r0": 1, "r1": 1})
+                assert record.state is ProducerPushState.FAILED
+                assert record.source is None
+                assert record.error == "complete shard failed"
+                assert all(future.done() for future in record.shard_futures)
+            finally:
+                finish_slow.set()
+                connector.shutdown()
+
+    @pytest.mark.parametrize("permanent_failure", [False, True])
+    def test_orphan_cancel_is_bounded_retryable_and_skips_cached_shards(
+        self, mock_vllm_config_producer, permanent_failure
+    ):
+        spec = ECMooncakePushSpec(
+            mm_hash="hash",
+            nbytes=64,
+            shape=(16,),
+            dtype="float32",
+            consumer_zmq="tcp://consumer:0",
+            transfer_id="transfer",
+            request_id="request",
+        )
+        reservation: Future[list[dict[str, Any]]] = Future()
+        reservation.set_result(
+            [
+                {
+                    "addr": "tcp://consumer:0",
+                    "reservation_id": "active",
+                },
+                {
+                    "addr": "tcp://consumer:1",
+                    "reservation_id": "cached",
+                    "cached": True,
+                },
+                {
+                    "addr": "tcp://consumer:2",
+                    "reservation_id": "cancelled",
+                    "cancelled": True,
+                },
+            ]
+        )
+        attempts: Counter[str] = Counter()
+
+        def request(_addr, payload):
+            reservation_id = payload["reservation_id"]
+            attempts[reservation_id] += 1
+            assert reservation_id == "active"
+            if permanent_failure or attempts[reservation_id] == 1:
+                raise RuntimeError("orphan cancel failed")
+            return {"cancelled": True}
+
+        with patch_ec_mooncake_deps():
+            connector = ECMooncakeConnector(
+                mock_vllm_config_producer, ECConnectorRole.WORKER
+            )
+            worker = connector._worker
+            record, _ = worker._producer_pushes.reserve(spec, lambda: reservation)
+            worker._producer_pushes.resolve_reservations(record)
+            assert worker._producer_pushes.cancel_requests({"request"}) == [record]
+            try:
+                with patch.object(
+                    worker._control_client, "request", side_effect=request
+                ):
+                    worker._producer_pushes.submit_cancel(
+                        record,
+                        worker._io_executor,
+                        worker._cancel_orphaned_reservation,
+                    )
+                    assert record.batch_future is not None
+                    if permanent_failure:
+                        with pytest.raises(
+                            RuntimeError, match="^orphan cancel failed$"
+                        ):
+                            record.batch_future.result(timeout=2)
+                    else:
+                        record.batch_future.result(timeout=2)
+                    failures = worker._producer_pushes.poll()
+
+                assert attempts == Counter({"active": 2})
+                assert record.state is ProducerPushState.CANCELLED
+                assert failures == (
+                    [("hash", "orphan cancel failed")] if permanent_failure else []
+                )
+            finally:
+                connector.shutdown()
+
+    def test_source_contract_checks_shape_dtype_contiguity_and_size(self):
+        tensors_and_specs = [
+            (torch.empty(2, 8), (16,), "float32", 64, "shape"),
+            (torch.empty(16, dtype=torch.float16), (16,), "float32", 32, "dtype"),
+            (torch.empty(4, 4).t(), (4, 4), "float32", 64, "contiguous"),
+            (torch.empty(16), (16,), "float32", 65, "size"),
+        ]
+        for index, (tensor, shape, dtype, nbytes, message) in enumerate(
+            tensors_and_specs
+        ):
+            spec = ECMooncakePushSpec(
+                mm_hash=f"hash-{index}",
+                nbytes=nbytes,
+                shape=shape,
+                dtype=dtype,
+                consumer_zmq="tcp://consumer:0",
+                transfer_id=f"transfer-{index}",
+            )
+            reservation: Future[list[dict[str, Any]]] = Future()
+            reservation.set_result([])
+            manager = ProducerPushManager()
+            record, _ = manager.reserve(spec, lambda future=reservation: future)
+            manager.bind_source(spec.mm_hash, tensor, None)
+            with pytest.raises(ValueError, match=message):
+                ECMooncakeWorker._validate_push_source(record)
+
+    def test_invalid_source_fails_asynchronously_before_staging(
+        self, mock_vllm_config_producer
+    ):
+        mock_vllm_config_producer.ec_transfer_config.ec_buffer_device = "cpu"
+        source = torch.empty(2, 8)
+        spec = ECMooncakePushSpec(
+            mm_hash="hash",
+            nbytes=source.nbytes,
+            shape=(16,),
+            dtype="float32",
+            consumer_zmq="tcp://consumer:0",
+            transfer_id="transfer",
+        )
+
+        def request(_addr, payload):
+            if payload["op"] == "reserve":
+                return {
+                    "reservation_id": "reservation",
+                    "dst_session": "session",
+                    "dst_ptr": 1000,
+                    "nbytes": source.nbytes,
+                    "write": True,
+                    "ready": False,
+                }
+            assert payload["op"] == "cancel"
+            return {"cancelled": True}
+
+        with patch_ec_mooncake_deps():
+            connector = ECMooncakeConnector(
+                mock_vllm_config_producer, ECConnectorRole.WORKER
+            )
+            worker = connector._worker
+            connector.bind_connector_metadata(
+                ECMooncakeConnectorMetadata(pushes=[spec])
+            )
+            try:
+                with (
+                    patch.object(
+                        worker._topology,
+                        "shards",
+                        return_value=["tcp://consumer:0"],
+                    ),
+                    patch.object(
+                        worker._control_client, "request", side_effect=request
+                    ),
+                    patch.object(worker._producer_memory, "stage") as stage,
+                    patch.object(worker._transfer, "acquire_sources") as register,
+                ):
+                    connector.start_save_caches(encoder_cache={"hash": source})
+                    assert connector.build_connector_worker_meta().pending_saves
+                    record = worker._producer_pushes.get("transfer")
+                    assert record is not None and record.batch_future is not None
+                    record.batch_future.result(timeout=2)
+                    connector.build_connector_worker_meta()
+
+                assert record.state is ProducerPushState.FAILED
+                assert record.source is None
+                assert record.error == "EC source shape mismatch for mm_hash=hash"
+                stage.assert_not_called()
+                register.assert_not_called()
+            finally:
                 connector.shutdown()
 
     def test_batches_pushes_from_one_model_step(self, mock_vllm_config_producer):
