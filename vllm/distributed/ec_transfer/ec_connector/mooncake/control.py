@@ -143,6 +143,25 @@ class ControlClient:
         self._context.destroy(linger=0)
 
 
+def make_cancel_request(
+    transfer_id: str,
+    reservation_id: str,
+    *,
+    abandon: bool = False,
+    refresh: bool = False,
+) -> ReservationActionRequest:
+    request: ReservationActionRequest = {
+        "op": "cancel",
+        "transfer_id": transfer_id,
+        "reservation_id": reservation_id,
+    }
+    if abandon:
+        request["abandon"] = True
+    if refresh:
+        request["refresh"] = True
+    return request
+
+
 class ShardTopology:
     """Discover and cache every control address for a consumer."""
 

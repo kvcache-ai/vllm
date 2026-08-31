@@ -27,6 +27,7 @@ from vllm.distributed.ec_transfer.ec_connector.mooncake.control import (
     ControlClient,
     EventInbox,
     ShardTopology,
+    make_cancel_request,
 )
 from vllm.distributed.ec_transfer.ec_connector.mooncake.metadata import (
     ECMooncakeConnectorMetadata,
@@ -126,11 +127,7 @@ class ECMooncakeScheduler:
         for addr in self._topology.shards(consumer_zmq):
             result = self._control_client.request(
                 addr,
-                {
-                    "op": "cancel",
-                    "transfer_id": transfer_id,
-                    "reservation_id": reservation_id,
-                },
+                make_cancel_request(transfer_id, reservation_id),
             )
             cancelled |= isinstance(result, dict) and bool(result.get("cancelled"))
         return cancelled

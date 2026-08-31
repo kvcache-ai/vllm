@@ -81,6 +81,10 @@ _TERMINAL_STATES = {
     ProducerPushState.CANCELLED,
     ProducerPushState.FAILED,
 }
+_SOURCE_WAIT_STATES = {
+    ProducerPushState.RESERVING,
+    ProducerPushState.WAITING_SOURCE,
+}
 _TERMINAL_LIMIT = 1 << 16
 
 
@@ -138,10 +142,7 @@ class ProducerPushManager:
             waiters = self._source_waiters.pop(mm_hash, OrderedDict())
             for transfer_id in waiters:
                 record = self._records[transfer_id]
-                if record.source is not None or record.state not in {
-                    ProducerPushState.RESERVING,
-                    ProducerPushState.WAITING_SOURCE,
-                }:
+                if record.source is not None or record.state not in _SOURCE_WAIT_STATES:
                     continue
                 record.source = ProducerSourceLease(tensor, ready_event)
                 record.source_at = time.monotonic()
@@ -159,11 +160,7 @@ class ProducerPushManager:
                 if (
                     record.source is not None
                     and record.batch_future is None
-                    and record.state
-                    in {
-                        ProducerPushState.RESERVING,
-                        ProducerPushState.WAITING_SOURCE,
-                    }
+                    and record.state in _SOURCE_WAIT_STATES
                 ):
                     grouped.setdefault(record.spec.consumer_zmq, []).append(record)
             batches = list(grouped.values())
@@ -274,10 +271,7 @@ class ProducerPushManager:
                     or record.batch_future is not None
                 ):
                     continue
-                if record.state not in {
-                    ProducerPushState.RESERVING,
-                    ProducerPushState.WAITING_SOURCE,
-                }:
+                if record.state not in _SOURCE_WAIT_STATES:
                     continue
                 self._transition(record, ProducerPushState.CANCEL_PENDING)
                 cancelled.append(record)
@@ -386,10 +380,7 @@ class ProducerPushManager:
                 f"{record.state.name} to {state.name}"
             )
         record.state = state
-        if state not in {
-            ProducerPushState.RESERVING,
-            ProducerPushState.WAITING_SOURCE,
-        }:
+        if state not in _SOURCE_WAIT_STATES:
             self._drop_source_waiter(record)
         if state in _TERMINAL_STATES:
             transfer_id = record.spec.transfer_id
