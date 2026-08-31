@@ -13,11 +13,13 @@ import sys
 import threading
 import time
 import weakref
-from collections import Counter
+from collections import Counter, OrderedDict
+from concurrent.futures import Future, ThreadPoolExecutor
 from contextlib import contextmanager
 from dataclasses import FrozenInstanceError
 from multiprocessing.reduction import ForkingPickler
 from types import ModuleType, SimpleNamespace
+from typing import Any
 from unittest.mock import MagicMock, Mock, call, patch
 
 import pytest
@@ -35,6 +37,7 @@ from vllm.distributed.ec_transfer.ec_connector.mooncake import (
     control,
     memory,
     metadata,
+    producer,
     state,
     transfer,
 )
@@ -51,6 +54,10 @@ from vllm.distributed.ec_transfer.ec_connector.mooncake.memory import (
     ContiguousAllocator,
     ProducerMemoryPool,
     ResidentPool,
+)
+from vllm.distributed.ec_transfer.ec_connector.mooncake.producer import (
+    ProducerPushManager,
+    ProducerPushState,
 )
 from vllm.distributed.ec_transfer.ec_connector.mooncake.reservation import (
     CancellationOutcome,
@@ -3254,6 +3261,536 @@ class TestECMooncakeWorkerTransfer:
             finally:
                 connector.shutdown()
 
+    def test_producer_push_state_owns_source_until_every_future_is_terminal(self):
+        manager = ProducerPushManager()
+        reservation: Future[list[dict[str, Any]]] = Future()
+        spec = ECMooncakePushSpec(
+            mm_hash="hash",
+            nbytes=64,
+            shape=(16,),
+            dtype="float32",
+            consumer_zmq="tcp://consumer:1",
+            transfer_id="transfer",
+        )
+        record, created = manager.reserve(spec, lambda: reservation)
+        duplicate, duplicate_created = manager.reserve(spec, lambda: Future())
+        assert created
+        assert duplicate is record
+        assert not duplicate_created
+        changed = copy.copy(spec)
+        changed.mm_hash = "other"
+        with pytest.raises(ValueError, match="changed identity"):
+            manager.reserve(changed, lambda: Future())
+
+        source = torch.empty(16)
+        manager.bind_source("hash", source, None)
+        assert record.source is not None
+        reservation.set_result([])
+        assert manager.resolve_reservations(record) == []
+        assert record.state is ProducerPushState.WAITING_SOURCE
+        manager.begin_writing(record)
+        manager.begin_notifying([record])
+
+        failed: Future[None] = Future()
+        failed.set_exception(RuntimeError("one shard failed"))
+        still_writing: Future[None] = Future()
+        manager.track_shard_futures([record], [failed, still_writing])
+        with pytest.raises(RuntimeError, match="source too early"):
+            manager.fail([record], RuntimeError("write failed"))
+        assert record.state is ProducerPushState.NOTIFYING
+        assert record.source is not None
+        assert record.source.tensor is source
+
+        still_writing.set_result(None)
+        manager.fail([record], RuntimeError("write failed"))
+        assert record.state is ProducerPushState.FAILED
+        assert record.source is None
+        manager.fail([record], RuntimeError("duplicate failure"))
+        with pytest.raises(RuntimeError, match="FAILED to NOTIFYING"):
+            manager.begin_notifying([record])
+
+        late, late_created = manager.reserve(spec, lambda: Future())
+        assert late is record
+        assert not late_created
+
+    def test_reservation_failure_after_source_binding_releases_the_lease(self):
+        manager = ProducerPushManager()
+        reservation: Future[list[dict[str, Any]]] = Future()
+        spec = ECMooncakePushSpec(
+            mm_hash="hash",
+            nbytes=64,
+            shape=(16,),
+            dtype="float32",
+            consumer_zmq="tcp://consumer:1",
+            transfer_id="transfer",
+        )
+        record, _ = manager.reserve(spec, lambda: reservation)
+        source = torch.empty(16)
+        manager.bind_source("hash", source, None)
+        reservation.set_exception(RuntimeError("reserve failed"))
+
+        assert record.state is ProducerPushState.RESERVING
+
+        def run(records) -> None:
+            try:
+                manager.resolve_reservations(records[0])
+            except RuntimeError as exc:
+                manager.fail(records, exc)
+
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            manager.submit_batches(executor, run, lambda: None)
+        assert manager.poll() == [("hash", "reserve failed")]
+        assert manager.poll() == []
+        assert record.state is ProducerPushState.FAILED
+        assert record.source is None
+
+    def test_late_reservation_callback_cannot_replace_refreshed_results(
+        self, mock_vllm_config_producer
+    ):
+        manager = ProducerPushManager()
+        reservation: Future[list[dict[str, Any]]] = Future()
+        callback_started = threading.Event()
+        finish_callback = threading.Event()
+
+        def block_callback(_future) -> None:
+            callback_started.set()
+            assert finish_callback.wait(2)
+
+        reservation.add_done_callback(block_callback)
+        spec = ECMooncakePushSpec(
+            mm_hash="hash",
+            nbytes=64,
+            shape=(16,),
+            dtype="float32",
+            consumer_zmq="tcp://consumer:1",
+            transfer_id="transfer",
+        )
+        record, _ = manager.reserve(spec, lambda: reservation)
+        old = [{"addr": "old", "reservation_id": "old"}]
+        refreshed = [{"addr": "new", "reservation_id": "new"}]
+        setter = threading.Thread(target=reservation.set_result, args=(old,))
+        setter.start()
+        assert callback_started.wait(2)
+        assert manager.resolve_reservations(record) == old
+        manager.replace_reservations(record, refreshed)
+        finish_callback.set()
+        setter.join(2)
+        assert not setter.is_alive()
+        manager.settle_all([record])
+        assert record.reservations == refreshed
+
+        with patch_ec_mooncake_deps():
+            connector = ECMooncakeConnector(
+                mock_vllm_config_producer, ECConnectorRole.WORKER
+            )
+            try:
+                with patch.object(
+                    connector._worker._control_client,
+                    "request",
+                ) as request:
+                    connector._worker._abandon_pushes([record])
+                assert request.call_args.args[1]["reservation_id"] == "new"
+            finally:
+                connector.shutdown()
+
+    def test_producer_hot_paths_do_not_scan_terminal_records(self):
+        manager = ProducerPushManager()
+        request_ids = set()
+        limit = 4096
+        with patch.object(producer, "_TERMINAL_LIMIT", limit):
+            for index in range(limit + 2):
+                reservation: Future[list[dict[str, Any]]] = Future()
+                reservation.set_result([])
+                request_id = f"request-{index}"
+                request_ids.add(request_id)
+                spec = ECMooncakePushSpec(
+                    mm_hash=f"hash-{index}",
+                    nbytes=64,
+                    shape=(16,),
+                    dtype="float32",
+                    consumer_zmq="tcp://consumer:1",
+                    transfer_id=f"transfer-{index}",
+                    request_id=request_id,
+                )
+                manager.reserve(spec, lambda r=reservation: r)
+            cancelled = manager.cancel_requests(request_ids)
+            assert len(cancelled) == limit + 2
+            for record in cancelled:
+                manager.finish_cancel(record)
+
+            pinned = manager.get("transfer-0")
+            assert pinned is not None
+            batch_started = threading.Event()
+            finish_batch = threading.Event()
+
+            def block_batch(_record) -> None:
+                batch_started.set()
+                assert finish_batch.wait(2)
+
+            executor = ThreadPoolExecutor(max_workers=1)
+            manager.submit_cancel(pinned, executor, block_batch)
+            assert batch_started.wait(2)
+
+            class NoScanRecords(OrderedDict):
+                def __iter__(self):
+                    raise AssertionError("record table scanned")
+
+                def items(self):
+                    raise AssertionError("record table scanned")
+
+                def values(self):
+                    raise AssertionError("record table scanned")
+
+            class NoScanIndex(OrderedDict):
+                def __iter__(self):
+                    raise AssertionError("reapable index scanned")
+
+                def items(self):
+                    raise AssertionError("reapable index scanned")
+
+                def values(self):
+                    raise AssertionError("reapable index scanned")
+
+            manager._records = NoScanRecords(manager._records)
+            manager._reapable_terminal_ids = NoScanIndex(manager._reapable_terminal_ids)
+            assert manager.pending
+            manager.submit_batches(MagicMock(), MagicMock(), MagicMock())
+            assert manager.poll() == []
+            assert manager.get("transfer-0") is pinned
+            assert manager.get("transfer-1") is None
+            assert manager.get(f"transfer-{limit}") is not None
+            assert len(manager._records) == limit + 1
+
+            finish_batch.set()
+            executor.shutdown(wait=True)
+            assert manager.poll() == []
+            assert manager.get("transfer-0") is pinned
+            assert manager.get("transfer-2") is None
+            assert len(manager._records) == limit
+
+    def test_producer_push_cancel_handles_pending_and_late_reservations(self):
+        manager = ProducerPushManager()
+        pending: Future[list[dict[str, Any]]] = Future()
+        spec = ECMooncakePushSpec(
+            mm_hash="hash",
+            nbytes=64,
+            shape=(16,),
+            dtype="float32",
+            consumer_zmq="tcp://consumer:1",
+            transfer_id="pending",
+            request_id="request",
+        )
+        record, _ = manager.reserve(spec, lambda: pending)
+        assert manager.pending
+        assert manager.cancel_requests({"request"}) == [record]
+        assert record.state is ProducerPushState.CANCEL_PENDING
+        manager.bind_source("hash", torch.empty(16), None)
+        assert record.source is None
+
+        pending.set_result([])
+        manager.resolve_reservations(record)
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            manager.submit_cancel(
+                record,
+                executor,
+                lambda cancelled: manager.finish_cancel(cancelled),
+            )
+        manager.finish_cancel(record)
+        manager.poll()
+        assert record.state is ProducerPushState.CANCELLED
+        assert not manager.pending
+        assert manager.cancel_requests({"request"}) == []
+
+        ready: Future[list[dict[str, Any]]] = Future()
+        ready.set_result([])
+        later = ECMooncakePushSpec(
+            mm_hash="other",
+            nbytes=64,
+            shape=(16,),
+            dtype="float32",
+            consumer_zmq="tcp://consumer:1",
+            transfer_id="ready",
+            request_id="request-2",
+        )
+        ready_record, _ = manager.reserve(later, lambda: ready)
+        manager.resolve_reservations(ready_record)
+        assert manager.cancel_requests({"request-2"}) == [ready_record]
+        assert ready_record.state is ProducerPushState.CANCEL_PENDING
+        manager.finish_cancel(ready_record)
+        assert ready_record.state is ProducerPushState.CANCELLED
+
+    def test_same_source_has_one_lease_per_transfer(self):
+        manager = ProducerPushManager()
+        source = torch.empty(16)
+        records = []
+        for transfer_id in ("first", "second"):
+            reservation: Future[list[dict[str, Any]]] = Future()
+            reservation.set_result([])
+            spec = ECMooncakePushSpec(
+                mm_hash="hash",
+                nbytes=source.nbytes,
+                shape=tuple(source.shape),
+                dtype="float32",
+                consumer_zmq="tcp://consumer:1",
+                transfer_id=transfer_id,
+            )
+            record, _ = manager.reserve(spec, lambda r=reservation: r)
+            records.append(record)
+        manager.bind_source("hash", source, None)
+        assert all(record.source is not None for record in records)
+        for record in records:
+            manager.resolve_reservations(record)
+            manager.begin_writing(record)
+            manager.begin_notifying([record])
+        manager.complete([records[0]])
+        assert records[0].source is None
+        assert records[1].source is not None
+        manager.complete([records[1]])
+        assert records[1].source is None
+
+    def test_shard_submit_failure_waits_before_source_release(
+        self, mock_vllm_config_producer
+    ):
+        mock_vllm_config_producer.ec_transfer_config.ec_buffer_device = "cpu"
+        source = torch.empty(16)
+        spec = ECMooncakePushSpec(
+            mm_hash="hash",
+            nbytes=source.nbytes,
+            shape=tuple(source.shape),
+            dtype="float32",
+            consumer_zmq="tcp://consumer:1",
+            transfer_id="transfer",
+        )
+        slow_started = threading.Event()
+        finish_slow = threading.Event()
+        slow_finished = threading.Event()
+        released_after_slow: list[bool] = []
+
+        def request(addr, payload):
+            if payload["op"] == "reserve":
+                index = int(addr.rsplit(":", 1)[1])
+                return {
+                    "reservation_id": f"reservation-{index}",
+                    "dst_session": f"session-{index}",
+                    "dst_ptr": 1000 + index,
+                    "nbytes": source.nbytes,
+                    "write": True,
+                    "ready": False,
+                }
+            return {}
+
+        def write(session, sources, destinations, lengths):
+            if session == "session-1":
+                slow_started.set()
+                assert finish_slow.wait(2)
+                slow_finished.set()
+
+        with patch_ec_mooncake_deps():
+            producer = ECMooncakeConnector(
+                mock_vllm_config_producer, ECConnectorRole.WORKER
+            )
+            worker = producer._worker
+            producer.bind_connector_metadata(ECMooncakeConnectorMetadata(pushes=[spec]))
+            try:
+                with (
+                    patch.object(
+                        worker._topology,
+                        "shards",
+                        return_value=[
+                            "tcp://consumer:0",
+                            "tcp://consumer:1",
+                            "tcp://consumer:2",
+                        ],
+                    ),
+                    patch.object(
+                        worker._control_client, "request", side_effect=request
+                    ),
+                    patch.object(worker._producer_memory, "stage", return_value=None),
+                    patch.object(
+                        worker._transfer,
+                        "acquire_sources",
+                        return_value=[source.data_ptr()],
+                    ),
+                    patch.object(
+                        worker._transfer,
+                        "release_sources",
+                        side_effect=lambda _: released_after_slow.append(
+                            slow_finished.is_set()
+                        ),
+                    ),
+                    patch.object(worker._transfer, "write", side_effect=write),
+                ):
+                    producer.start_save_caches(encoder_cache={"hash": source})
+                    record = worker._producer_pushes.get("transfer")
+                    assert record is not None
+                    record.reservation_futures[0].result(timeout=2)
+                    with ThreadPoolExecutor(max_workers=1) as executor:
+                        submit_count = 0
+
+                        def submit(fn, *args):
+                            nonlocal submit_count
+                            submit_count += 1
+                            if submit_count == 1:
+                                return executor.submit(fn, *args)
+                            raise RuntimeError("second shard submit failed")
+
+                        shard_executor = MagicMock()
+                        shard_executor.submit.side_effect = submit
+                        with patch.object(
+                            worker,
+                            "_shard_executor",
+                            return_value=shard_executor,
+                        ):
+                            assert producer.build_connector_worker_meta().pending_saves
+                            assert slow_started.wait(2)
+                            assert record.source is not None
+                            assert released_after_slow == []
+                            finish_slow.set()
+                            _wait_for_worker_io(producer)
+
+                record = worker._producer_pushes.get("transfer")
+                assert record is not None
+                assert record.state is ProducerPushState.FAILED
+                assert record.source is None
+                assert released_after_slow == [True]
+            finally:
+                finish_slow.set()
+                producer.shutdown()
+
+    def test_reserve_failure_waits_for_every_started_shard(
+        self, mock_vllm_config_producer
+    ):
+        spec = ECMooncakePushSpec(
+            mm_hash="hash",
+            nbytes=64,
+            shape=(16,),
+            dtype="float32",
+            consumer_zmq="tcp://consumer:1",
+            transfer_id="transfer",
+        )
+        slow_started = threading.Event()
+        finish_slow = threading.Event()
+        finished = threading.Event()
+        errors: list[Exception] = []
+
+        def reserve_one(addr, _spec):
+            if addr.endswith(":0"):
+                raise RuntimeError("first shard failed")
+            if addr.endswith(":2"):
+                slow_started.set()
+                assert finish_slow.wait(2)
+            return {"addr": addr}
+
+        with patch_ec_mooncake_deps():
+            producer = ECMooncakeConnector(
+                mock_vllm_config_producer, ECConnectorRole.WORKER
+            )
+            worker = producer._worker
+
+            def reserve() -> None:
+                try:
+                    worker._reserve_remote(spec)
+                except Exception as exc:
+                    errors.append(exc)
+                finally:
+                    finished.set()
+
+            try:
+                with (
+                    patch.object(
+                        worker._topology,
+                        "shards",
+                        return_value=["shard:0", "shard:1", "shard:2"],
+                    ),
+                    patch.object(worker, "_reserve_one", side_effect=reserve_one),
+                ):
+                    thread = threading.Thread(target=reserve)
+                    thread.start()
+                    assert slow_started.wait(2)
+                    assert not finished.wait(0.05)
+                    finish_slow.set()
+                    thread.join(2)
+                assert not thread.is_alive()
+                assert len(errors) == 1
+                assert str(errors[0]) == "first shard failed"
+            finally:
+                finish_slow.set()
+                producer.shutdown()
+
+    def test_reserve_submit_failure_drains_started_shards(
+        self, mock_vllm_config_producer
+    ):
+        spec = ECMooncakePushSpec(
+            mm_hash="hash",
+            nbytes=64,
+            shape=(16,),
+            dtype="float32",
+            consumer_zmq="tcp://consumer:1",
+            transfer_id="transfer",
+        )
+        slow_started = threading.Event()
+        finish_slow = threading.Event()
+        finished = threading.Event()
+        errors: list[Exception] = []
+
+        def reserve_one(addr, _spec):
+            slow_started.set()
+            assert finish_slow.wait(2)
+            return {"addr": addr}
+
+        with patch_ec_mooncake_deps():
+            connector = ECMooncakeConnector(
+                mock_vllm_config_producer, ECConnectorRole.WORKER
+            )
+            worker = connector._worker
+
+            def reserve() -> None:
+                try:
+                    worker._reserve_remote(spec)
+                except Exception as exc:
+                    errors.append(exc)
+                finally:
+                    finished.set()
+
+            try:
+                with ThreadPoolExecutor(max_workers=1) as executor:
+                    submit_count = 0
+
+                    def submit(fn, *args):
+                        nonlocal submit_count
+                        submit_count += 1
+                        if submit_count == 1:
+                            return executor.submit(fn, *args)
+                        raise RuntimeError("second shard submit failed")
+
+                    shard_executor = MagicMock()
+                    shard_executor.submit.side_effect = submit
+                    with (
+                        patch.object(
+                            worker._topology,
+                            "shards",
+                            return_value=["shard:0", "shard:1", "shard:2"],
+                        ),
+                        patch.object(worker, "_reserve_one", side_effect=reserve_one),
+                        patch.object(
+                            worker,
+                            "_shard_executor",
+                            return_value=shard_executor,
+                        ),
+                    ):
+                        thread = threading.Thread(target=reserve)
+                        thread.start()
+                        assert slow_started.wait(2)
+                        assert not finished.wait(0.05)
+                        finish_slow.set()
+                        thread.join(2)
+                assert not thread.is_alive()
+                assert len(errors) == 1
+                assert str(errors[0]) == "second shard submit failed"
+            finally:
+                finish_slow.set()
+                connector.shutdown()
+
     def test_batches_pushes_from_one_model_step(self, mock_vllm_config_producer):
         port = _find_free_port()
         consumer_cfg = Mock(spec=VllmConfig)
@@ -3349,7 +3886,9 @@ class TestECMooncakeWorkerTransfer:
             producer.bind_connector_metadata(ECMooncakeConnectorMetadata(pushes=[push]))
             try:
                 producer.start_save_caches(encoder_cache={})
-                _, reservation = producer._worker._pending_reservations["hash"][0]
+                push_record = producer._worker._producer_pushes.get("transfer-1")
+                assert push_record is not None
+                reservation = push_record.reservation_futures[0]
                 shards = reservation.result(timeout=2)
                 # One reservation per consumer shard; this consumer is single.
                 assert len(shards) == 1
@@ -3444,13 +3983,17 @@ class TestECMooncakeWorkerTransfer:
             producer.bind_connector_metadata(ECMooncakeConnectorMetadata(pushes=[push]))
             try:
                 producer.start_save_caches(encoder_cache={})
-                _, reservation = producer._worker._pending_reservations["hash"][0]
+                push_record = producer._worker._producer_pushes.get("transfer-1")
+                assert push_record is not None
+                reservation = push_record.reservation_futures[0]
                 reservation.result(timeout=2)
                 assert consumer._worker._reservations.status("transfer-1")
 
                 producer.get_finished({"request-1"})
                 _wait_for_worker_io(producer)
-                assert "hash" not in producer._worker._pending_reservations
+                push_record = producer._worker._producer_pushes.get("transfer-1")
+                assert push_record is not None
+                assert push_record.state is ProducerPushState.CANCELLED
                 assert consumer._worker._reservations.status("transfer-1") is None
             finally:
                 producer.shutdown()
