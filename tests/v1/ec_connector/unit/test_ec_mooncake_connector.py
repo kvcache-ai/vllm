@@ -885,6 +885,25 @@ class TestMooncakeECConfig:
             config.pool_size,
         ) == (1500, 2.5, 2048)
 
+    @pytest.mark.parametrize("key", ["control_timeout_s", "push_wait_timeout_s"])
+    @pytest.mark.parametrize("value", [float("nan"), float("inf"), float("-inf"), True])
+    def test_rejects_invalid_timeouts(self, mock_vllm_config_producer, key, value):
+        mock_vllm_config_producer.ec_transfer_config.ec_connector_extra_config[key] = (
+            value
+        )
+
+        with pytest.raises(ValueError, match=key):
+            MooncakeECConfig.from_vllm_config(mock_vllm_config_producer)
+
+    @pytest.mark.parametrize(
+        "value", [1.5, True, float("nan"), float("inf"), float("-inf")]
+    )
+    def test_rejects_invalid_registered_buffer(self, mock_vllm_config_producer, value):
+        mock_vllm_config_producer.ec_transfer_config.ec_buffer_size = value
+
+        with pytest.raises(ValueError, match="ec_buffer_size"):
+            MooncakeECConfig.from_vllm_config(mock_vllm_config_producer)
+
     @pytest.mark.parametrize(
         ("attribute", "message"),
         [

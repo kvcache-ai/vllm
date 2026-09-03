@@ -15,17 +15,36 @@ if TYPE_CHECKING:
 _RESERVATION_TTL_SECONDS = 300
 
 
-def _positive_int(name: str, value: float) -> int:
-    result = int(value)
+def _positive_int(name: str, value: object) -> int:
+    message = f"ECMooncakeConnector requires {name} to be a positive integer."
+    if isinstance(value, bool):
+        raise ValueError(message)
+    if isinstance(value, int):
+        result = value
+    elif isinstance(value, float) and math.isfinite(value) and value.is_integer():
+        result = int(value)
+    elif isinstance(value, str):
+        try:
+            result = int(value)
+        except ValueError as error:
+            raise ValueError(message) from error
+    else:
+        raise ValueError(message)
     if result <= 0:
         raise ValueError(f"ECMooncakeConnector requires {name} > 0.")
     return result
 
 
 def _positive_float(name: str, value: object) -> float:
-    result = float(value)  # type: ignore[arg-type]
-    if result <= 0:
-        raise ValueError(f"ECMooncakeConnector requires {name} > 0.")
+    message = f"ECMooncakeConnector requires {name} > 0."
+    if isinstance(value, bool):
+        raise ValueError(message)
+    try:
+        result = float(value)  # type: ignore[arg-type]
+    except (TypeError, ValueError) as error:
+        raise ValueError(message) from error
+    if not math.isfinite(result) or result <= 0:
+        raise ValueError(message)
     return result
 
 
